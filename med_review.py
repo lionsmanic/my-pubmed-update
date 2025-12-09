@@ -10,13 +10,21 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 側邊欄：設定區 ---
+# 修改側邊欄程式碼片段
 with st.sidebar:
     st.header("⚙️ 設定控制台")
     
-    # 1. 安全輸入 API Key
-    api_key = st.text_input("請輸入 Google Gemini API Key", type="password")
-    email_input = st.text_input("請輸入您的 Email (PubMed 規範要求)", "lionsmanic@gmail.com")
+    # 嘗試從 Secrets 讀取，如果沒有才讓使用者輸入
+    if 'GEMINI_API_KEY' in st.secrets:
+        api_key = st.secrets['GEMINI_API_KEY']
+        st.success("✅ 已從系統讀取 API Key")
+    else:
+        api_key = st.text_input("請輸入 Google Gemini API Key", type="password")
+
+    if 'EMAIL_ADDRESS' in st.secrets:
+        email_input = st.secrets['EMAIL_ADDRESS']
+    else:
+        email_input = st.text_input("Email", "lionsmanic@gmail.com")
     
     st.divider()
     
