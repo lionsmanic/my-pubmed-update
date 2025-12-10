@@ -6,7 +6,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import time
-import importlib.metadata # 用來檢查版本
+import importlib.metadata
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="GynOnc 文獻智庫", page_icon="🧬", layout="wide")
@@ -19,30 +19,30 @@ if 'analyzed_count' not in st.session_state:
 if 'run_analysis' not in st.session_state:
     st.session_state.run_analysis = False
 
-# --- 側邊欄：設定控制台 ---
+# --- 側邊欄 ---
 with st.sidebar:
-    st.title("⚙️ 設定與診斷")
+    st.header("⚙️ 設定與診斷")
     
-    # --- 🔎 版本診斷區 (新增) ---
+    # 顯示套件版本
     try:
         ver = importlib.metadata.version('google-generativeai')
-        if ver >= "0.8.3":
-            st.success(f"✅ 套件版本正確: {ver}")
+        if ver >= "0.7.0":
+            st.success(f"✅ 套件版本 OK: {ver}")
         else:
-            st.error(f"❌ 套件版本過舊: {ver}\n請刪除 App 重新部署！")
+            st.error(f"⚠️ 套件版本過舊: {ver}\n請刪除 App 重新部署！")
     except:
-        st.error("❌ 無法偵測套件")
+        st.warning("無法偵測版本")
+
     st.divider()
-    # ---------------------------
-    
-    # 1. API Key 設定
+
+    # 1. API Key
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
         st.info("🔑 API Key 已載入 (Secrets)")
     else:
         api_key = st.text_input("Gemini API Key", type="password")
 
-    # 2. Email 設定
+    # 2. Email
     if 'EMAIL_ADDRESS' in st.secrets:
         user_email = st.secrets['EMAIL_ADDRESS']
     else:
@@ -55,10 +55,7 @@ with st.sidebar:
 
     st.divider()
     
-    # 3. 搜尋條件
-    st.subheader("🔍 搜尋參數")
-    
-    # 定義關鍵字
+    # 3. 搜尋設定
     KEYWORDS = {
         "🥚 婦癌 (Gyn Onc)": [
             "cervical cancer", "ovarian cancer", "endometrial cancer", 
@@ -81,6 +78,7 @@ with st.sidebar:
         "Gynecologic Oncology", "Journal of Gynecologic Oncology"
     ]
 
+    st.subheader("🔍 搜尋參數")
     selected_categories = st.multiselect("選擇類別", list(KEYWORDS.keys()), default=["🥚 婦癌 (Gyn Onc)"])
     active_keywords = []
     for cat in selected_categories:
@@ -99,7 +97,7 @@ with st.sidebar:
         st.session_state.email_content = ""
         st.session_state.analyzed_count = 0
 
-# --- 核心函數 ---
+# --- 核心功能 ---
 
 def build_query(keywords, journals):
     if not keywords: return ""
@@ -135,14 +133,41 @@ def fetch_data(query, days, limit, email):
     except Exception as e:
         st.error(f"PubMed Error: {e}"); return []
 
-def run_ai(art, key):
-    # 直接指定最新模型
-    target_model = 'gemini-1.5-flash'
+def run_ai_robust(art, key):
+    # 自動嘗試多種模型名稱
+    models_to_try = [
+        'gemini-1.5-flash', 
+        'gemini-1.5-flash-latest', 
+        'gemini-1.5-pro',
+        'gemini-pro',       # 舊版模型 (備用)
+        'gemini-1.0-pro'    # 舊版別名 (備用)
+    ]
+    
+    genai.configure(api_key=key)
+    
+    selected_model = None
+    last_error = ""
+    
+    # 迴圈測試哪個模型可用
+    for model_name in models_to_try:
+        try:
+            m = genai.GenerativeModel(model_name)
+            # 測試連線
+            m.generate_content("test")
+            selected_model = m
+            # st.toast(f"成功連線模型: {model_name}") # 除錯用
+            break
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    if not selected_model:
+        return f"<div style='color:red; border:1px solid red; padding:10px;'>❌ 所有模型皆失敗。最後錯誤: {last_error}<br>請務必刪除 App 重新部署以更新環境。</div>"
+
+    # 正式分析
     try:
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel(target_model)
         prompt = f"""
-        角色：婦癌專家。請將以下摘要轉成繁體中文臨床重點 (HTML)。
+        角色：婦科腫瘤專家。請將以下摘要轉成繁體中文臨床重點 (HTML)。
         標題：{art['title']}
         摘要：{art['abstract']}
         
@@ -162,17 +187,19 @@ def run_ai(art, key):
             </ul>
         </div>
         """
-        res = model.generate_content(prompt)
+        res = selected_model.generate_content(prompt)
         return res.text
     except Exception as e:
-        return f"<div style='color:red; border:1px solid red; padding:10px;'>❌ AI 分析失敗: {str(e)}</div>"
+        return f"<div style='color:red;'>❌ 分析中斷: {str(e)}</div>"
 
 def send_mail(to, pwd, html):
     msg = MIMEMultipart()
     msg['From'] = to
     msg['To'] = to
     msg['Subject'] = f"GynOnc Report {datetime.now().strftime('%Y-%m-%d')}"
-    msg.attach(MIMEText(html, 'html'))
+    
+    full_html = f"<html><body style='font-family:Arial;'>{html}</body></html>"
+    msg.attach(MIMEText(full_html, 'html'))
     try:
         s = smtplib.SMTP('smtp.gmail.com', 587)
         s.starttls()
@@ -203,7 +230,8 @@ if st.session_state.run_analysis:
                 
                 for i, art in enumerate(arts):
                     st.write(f"🤖 分析 #{i+1}...")
-                    ai_html = run_ai(art, api_key)
+                    # 使用新的 robust 函數
+                    ai_html = run_ai_robust(art, api_key)
                     
                     with cont:
                         st.subheader(f"{i+1}. {art['title']}")
