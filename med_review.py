@@ -1,182 +1,302 @@
 import streamlit as st
 import google.generativeai as genai
 from Bio import Entrez
-import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+import time
+
+# --- 1. 預定義的專業關鍵字與期刊清單 ---
+KEYWORDS = {
+    "🥚 婦癌 (Gyn Onc)": [
+        "cervical cancer", "ovarian cancer", "endometrial cancer", 
+        "immunotherapy", "robotic surgery", "sarcoma", 
+        "gynecologic neoplasms"
+    ],
+    "🌊 海扶刀 (HIFU)": [
+        "HIFU", "high intensity focused ultrasound", 
+        "uterine leiomyoma", "adenomyosis", "fibroid"
+    ],
+    "🧬 其他/精準醫療": [
+        "genetic test", "targeted therapy"
+    ]
+}
+
+JOURNALS = [
+    "New England Journal of Medicine", 
+    "Nature", 
+    "Science", 
+    "Cell", 
+    "The Lancet", 
+    "The Lancet Oncology", 
+    "Nature Communications", 
+    "Journal of Clinical Oncology", 
+    "JAMA", 
+    "Gynecologic Oncology", 
+    "Journal of Gynecologic Oncology"
+]
 
 # --- 頁面設定 ---
-st.set_page_config(
-    page_title="婦科腫瘤文獻智慧分析",
-    page_icon="🧬",
-    layout="wide"
-)
+st.set_page_config(page_title="GynOnc 文獻智庫", page_icon="🧬", layout="wide")
 
-# 修改側邊欄程式碼片段
+# --- Session State 初始化 (確保按鈕點擊後資料還在) ---
+if 'email_content' not in st.session_state:
+    st.session_state.email_content = ""
+if 'analyzed_count' not in st.session_state:
+    st.session_state.analyzed_count = 0
+if 'run_analysis' not in st.session_state:
+    st.session_state.run_analysis = False
+
+# --- 側邊欄：設定區 ---
 with st.sidebar:
     st.header("⚙️ 設定控制台")
     
-    # 嘗試從 Secrets 讀取，如果沒有才讓使用者輸入
+    # 1. API Key 設定 (優先讀取 Secrets)
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
-        st.success("✅ 已從系統讀取 API Key")
+        st.success("🔑 Gemini API Key 已載入")
     else:
-        api_key = st.text_input("請輸入 Google Gemini API Key", type="password")
+        api_key = st.text_input("Gemini API Key", type="password")
 
+    # 2. Email 設定 (優先讀取 Secrets)
     if 'EMAIL_ADDRESS' in st.secrets:
-        email_input = st.secrets['EMAIL_ADDRESS']
+        user_email = st.secrets['EMAIL_ADDRESS']
     else:
-        email_input = st.text_input("Email", "lionsmanic@gmail.com")
-    
+        user_email = st.text_input("您的 Email", "lionsmanic@gmail.com")
+        
+    if 'EMAIL_PASSWORD' in st.secrets:
+        email_password = st.secrets['EMAIL_PASSWORD']
+        st.success("🔑 Gmail 應用程式密碼已載入")
+    else:
+        email_password = st.text_input("Gmail 應用程式密碼 (寄信用)", type="password", help="若只需瀏覽不需寄信可不填")
+
     st.divider()
     
-    # 2. 搜尋參數
-    st.subheader("🔍 搜尋條件")
-    # 預設一些婦癌關鍵字
-    default_query = '("Ovarian Neoplasms"[Mesh] OR "Uterine Cervical Neoplasms"[Mesh]) AND "2024"[Date - Publication]'
-    query = st.text_area("PubMed 搜尋語法 (支援布林邏輯)", value=default_query, height=100)
+    st.subheader("🔍 1. 選擇搜尋主題")
+    selected_categories = st.multiselect("選擇類別", list(KEYWORDS.keys()), default=["🥚 婦癌 (Gyn Onc)"])
     
-    st.info("💡 提示：您可以輸入 'Lancet Oncol[Journal]' 來鎖定特定期刊。")
+    # 組合並顯示關鍵字
+    active_keywords = []
+    for cat in selected_categories:
+        active_keywords.extend(KEYWORDS[cat])
     
-    max_results = st.slider("分析篇數 (建議 3-5 篇以節省時間)", 1, 10, 3)
-    
-    # 按鈕
-    start_btn = st.button("🚀 開始搜尋與分析", type="primary")
+    final_keywords = st.multiselect("微調搜尋關鍵字", active_keywords, default=active_keywords)
 
-# --- 核心函數：抓取 PubMed ---
-def fetch_pubmed_articles(query, max_results, email):
+    st.subheader("📚 2. 期刊篩選")
+    use_specific_journals = st.checkbox("限定於指定權威期刊?", value=True)
+    if use_specific_journals:
+        selected_journals = st.multiselect("選擇期刊", JOURNALS, default=JOURNALS)
+    
+    st.subheader("📅 3. 其他條件")
+    days_back = st.slider("搜尋過去幾天?", 1, 60, 7) # 範圍加大到60天以免沒文章
+    max_results = st.slider("分析篇數上限", 1, 10, 3)
+    
+    # 啟動按鈕
+    if st.button("🚀 開始搜尋與分析", type="primary"):
+        st.session_state.run_analysis = True
+        # 重置之前的結果
+        st.session_state.email_content = ""
+        st.session_state.analyzed_count = 0
+
+# --- 核心功能函數 ---
+
+def build_pubmed_query(keywords, journals, days_back):
+    # 建立搜尋語法
+    if not keywords: return ""
+    term_query = "(" + " OR ".join([f'"{k}"[Title/Abstract]' for k in keywords]) + ")"
+    
+    if journals:
+        journal_query = "(" + " OR ".join([f'"{j}"[Journal]' for j in journals]) + ")"
+        final_query = f"{term_query} AND {journal_query}"
+    else:
+        final_query = term_query
+    return final_query
+
+def fetch_pubmed(query, days, max_res, email):
     Entrez.email = email
     try:
-        # 1. 搜尋 ID
-        search_handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="date")
-        search_results = Entrez.read(search_handle)
-        search_handle.close()
+        # 使用 reldate 限制日期
+        handle = Entrez.esearch(db="pubmed", term=query, reldate=days, retmax=max_res, sort="date")
+        record = Entrez.read(handle)
+        id_list = record["IdList"]
+        if not id_list: return []
         
-        id_list = search_results["IdList"]
-        if not id_list:
-            return []
-
-        # 2. 抓取詳細內容
-        fetch_handle = Entrez.efetch(db="pubmed", id=id_list, retmode="xml")
-        articles_data = Entrez.read(fetch_handle)
-        fetch_handle.close()
+        handle = Entrez.efetch(db="pubmed", id=id_list, retmode="xml")
+        articles = Entrez.read(handle)
         
-        parsed_articles = []
-        for article in articles_data['PubmedArticle']:
+        parsed = []
+        for art in articles['PubmedArticle']:
             try:
-                citation = article['MedlineCitation']
-                title = citation['Article']['ArticleTitle']
+                cit = art['MedlineCitation']
+                title = cit['Article']['ArticleTitle']
+                journal = cit['Article']['Journal']['Title']
+                # 處理沒有摘要的情況
+                abstract = " ".join([str(x) for x in cit['Article']['Abstract']['AbstractText']]) if 'Abstract' in cit['Article'] else "No Abstract"
                 
-                # 處理摘要列表
-                if 'Abstract' in citation['Article']:
-                    abstract_parts = citation['Article']['Abstract']['AbstractText']
-                    abstract = " ".join([str(part) for part in abstract_parts])
-                else:
-                    abstract = "無摘要 (No Abstract Available)"
-                
-                # 抓取期刊與年份
-                journal = citation['Article']['Journal']['Title']
-                pub_date = citation['Article']['Journal']['JournalIssue']['PubDate']
-                date_str = f"{pub_date.get('Year', '')} {pub_date.get('Month', '')}"
-                
-                # 抓取 DOI 連結
-                ids = article['PubmedData']['ArticleIdList']
+                ids = art['PubmedData']['ArticleIdList']
                 doi = next((item for item in ids if item.attributes['IdType'] == 'doi'), None)
                 link = f"https://doi.org/{doi}" if doi else f"https://pubmed.ncbi.nlm.nih.gov/{ids[0]}/"
-
-                parsed_articles.append({
-                    "title": title,
-                    "abstract": abstract,
-                    "journal": journal,
-                    "date": date_str,
-                    "link": link
-                })
-            except Exception as e:
-                continue # 跳過格式錯誤的文章
                 
-        return parsed_articles
-
+                parsed.append({"title": title, "journal": journal, "abstract": abstract, "link": link})
+            except: continue
+        return parsed
     except Exception as e:
         st.error(f"PubMed 連線錯誤: {e}")
         return []
 
-# --- 核心函數：Gemini 分析 ---
-def analyze_article(article, api_key):
-    genai.configure(api_key=api_key)
-    # 使用 Flash 模型速度較快且便宜，若需要更深度的推理可改用 pro
-    model = genai.GenerativeModel('gemini-1.5-flash') 
+def gemini_analyze(article, key):
+    genai.configure(api_key=key)
     
+    # --- 模型備援機制 (解決 404 問題) ---
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+    model = None
+    
+    for model_name in models_to_try:
+        try:
+            temp_model = genai.GenerativeModel(model_name)
+            # 簡單測試是否可用
+            temp_model.generate_content("Hi") 
+            model = temp_model
+            break # 成功就跳出迴圈
+        except Exception:
+            continue # 失敗就試下一個
+            
+    if not model:
+        return "❌ 錯誤：所有 AI 模型皆無法連線，請檢查 API Key 或套件版本。"
+
+    # --- Prompt 設計 ---
     prompt = f"""
-    你現在是一位權威的「婦科腫瘤學教授」與臨床醫師。請閱讀以下這篇醫學文獻的摘要，並為你的主治醫師團隊用「繁體中文」做重點解讀。
+    角色：你是婦科腫瘤學的資深臨床醫師與研究員。
+    任務：閱讀以下文獻摘要，並轉化為繁體中文的臨床簡報。
+    格式：請直接輸出 HTML 代碼 (不要包含 ```html 標籤)，以便嵌入網頁與郵件。
     
-    【文獻資訊】
-    標題: {article['title']}
-    期刊: {article['journal']}
-    摘要: {article['abstract']}
+    文獻標題：{article['title']}
+    期刊：{article['journal']}
+    摘要：{article['abstract']}
     
-    【請依序輸出以下區塊，並使用 Markdown 格式排版】：
-
-    ### 1. 📝 文獻快報 (Structured Summary)
-    請簡明扼要地整理：
-    * **Background (背景)**: 
-    * **Methods (方法)**: 
-    * **Results (主要結果)**: (請包含重要的統計數據，如 P值、HR、OR等)
-    * **Conclusion (結論)**: 
-
-    ### 2. 💡 發想緣起 (Origin of the Idea)
-    (請根據背景推論：為什麼作者想做這個研究？是為了解決什麼過去臨床上的痛點、爭議或是補足哪塊證據？)
-
-    ### 3. 🏥 臨床可行運用 (Clinical Application)
-    (這對我們目前的臨床實踐有什麼直接影響？是否支持改變現有的治療策略？例如手術方式、化療藥物選擇或篩檢流程？若尚不可行，請說明原因。)
-
-    ### 4. 🚀 婦癌醫師的研究機遇 (Future Directions for GynOnc)
-    (針對婦科腫瘤醫師，這篇研究啟發了什麼後續方向？有沒有我們可以在本地醫院利用現有病歷資料進行驗證的題目？或是延伸的子題？)
+    請依照以下結構撰寫 HTML：
+    <div style="font-family: sans-serif;">
+        <h4 style="color: #2e86c1; margin-bottom: 5px;">1. 📝 重點摘要</h4>
+        <ul style="margin-top: 0;">
+            <li><b>背景/目的</b>: ...</li>
+            <li><b>結果 (數據)</b>: (請務必保留 P值、HR、OR 等重要統計數據)...</li>
+            <li><b>結論</b>: ...</li>
+        </ul>
+        <h4 style="color: #d35400; margin-bottom: 5px;">2. 💡 臨床洞察與發想</h4>
+        <ul style="margin-top: 0;">
+            <li><b>發想來源</b>: (這篇文章是基於什麼臨床痛點或未解之謎？)</li>
+            <li><b>臨床可行運用</b>: (對婦科腫瘤醫師而言，這改變了什麼處置流程？)</li>
+            <li><b>未來研究機會</b>: (我們是否能模仿此研究？或有哪些延伸題目適合繼續發展？)</li>
+        </ul>
+    </div>
     """
-    
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"AI 分析失敗: {e}"
+        return f"AI 分析過程中發生錯誤: {e}"
 
-# --- 主畫面邏輯 ---
-st.title("🧬 GynOnc 醫學文獻智慧分析助手")
-st.markdown("專為婦科腫瘤醫師設計，自動抓取 PubMed 並生成臨床應用導向的分析報告。")
+def send_email_via_gmail(to_email, password, html_content):
+    msg = MIMEMultipart()
+    msg['From'] = to_email
+    msg['To'] = to_email
+    msg['Subject'] = f"GynOnc 每週文獻彙整 ({datetime.now().strftime('%Y-%m-%d')})"
+    
+    # 加上 email 標頭樣式
+    full_html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2 style="color: #2c3e50;">🧬 婦科腫瘤文獻智慧報告</h2>
+        <p>生成時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        <hr style="border: 1px solid #eee;">
+        {html_content}
+        <br>
+        <p style="font-size: 0.8em; color: #999;">本郵件由 Streamlit AI 助手自動生成。</p>
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(full_html, 'html'))
+    
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(to_email, password)
+        server.send_message(msg)
+        server.quit()
+        return True, "寄送成功！"
+    except Exception as e:
+        return False, f"寄送失敗: {e}"
 
-if start_btn:
+# --- 主程式邏輯 ---
+
+st.title("🧬 GynOnc 婦癌文獻智庫 (AI Assistant)")
+
+# 執行分析
+if st.session_state.run_analysis:
     if not api_key:
-        st.warning("⚠️ 請先在側邊欄輸入 Gemini API Key")
+        st.warning("⚠️ 請輸入 Gemini API Key 才能開始。")
+    elif not final_keywords:
+        st.warning("⚠️ 請至少選擇一個搜尋關鍵字。")
     else:
-        with st.status("🔄 正在執行任務中...", expanded=True) as status:
+        # 1. 搜尋
+        with st.status("🔄 正在搜尋 PubMed...", expanded=True) as status:
+            q = build_pubmed_query(final_keywords, selected_journals if use_specific_journals else None, days_back)
+            st.write(f"搜尋語法: `{q[:100]}...`") # 顯示部分語法
             
-            # 1. 搜尋
-            st.write("📡 連接 PubMed 資料庫搜尋中...")
-            articles = fetch_pubmed_articles(query, max_results, email_input)
+            articles = fetch_pubmed(q, days_back, max_results, user_email)
             
             if not articles:
-                status.update(label="❌ 搜尋不到結果，請檢查關鍵字", state="error")
+                status.update(label="❌ 最近沒有符合條件的新文章。", state="error")
+                st.session_state.run_analysis = False # 停止狀態
             else:
-                st.write(f"✅ 成功抓取 {len(articles)} 篇文章，開始 AI 閱讀分析...")
+                st.write(f"✅ 找到 {len(articles)} 篇，AI 正在逐篇閱讀分析...")
                 
-                # 建立一個容器來放結果
+                # 清空並準備 Email 內容容器
+                st.session_state.email_content = ""
+                
                 results_container = st.container()
                 
-                for i, article in enumerate(articles):
-                    st.write(f"🤖 正在分析第 {i+1} 篇: {article['title'][:30]}...")
+                for i, art in enumerate(articles):
+                    st.write(f"🤖 分析第 {i+1} 篇: {art['title'][:30]}...")
+                    analysis_html = gemini_analyze(art, api_key)
                     
-                    # 呼叫 Gemini
-                    analysis = analyze_article(article, api_key)
-                    
-                    # 顯示結果
+                    # 畫面顯示
                     with results_container:
                         st.markdown("---")
-                        st.subheader(f"#{i+1} {article['title']}")
-                        st.caption(f"📖 {article['journal']} | 🗓️ {article['date']}")
-                        st.markdown(f"🔗 [點擊閱讀原文]({article['link']})")
-                        
-                        with st.expander("查看原始摘要 (English Abstract)"):
-                            st.text(article['abstract'])
-                        
-                        # AI 輸出區塊 - 重點樣式
-                        st.info("🤖 **Gemini 教授的分析報告**")
-                        st.markdown(analysis)
+                        st.subheader(f"#{i+1} {art['title']}")
+                        st.caption(f"📖 {art['journal']} | 🗓️ {days_back}天內 | 🔗 [原文連結]({art['link']})")
+                        st.markdown(analysis_html, unsafe_allow_html=True)
+                    
+                    # Email 內容堆疊
+                    st.session_state.email_content += f"""
+                    <div style="margin-bottom: 30px; padding: 15px; background-color: #f8f9fa; border-left: 5px solid #17a2b8; border-radius: 4px;">
+                        <h3 style="margin-top: 0; color: #1a5276;"><a href="{art['link']}" style="text-decoration: none; color: #1a5276;">{art['title']}</a></h3>
+                        <p style="font-size: 0.9em; color: #666;">📖 {art['journal']}</p>
+                        {analysis_html}
+                    </div>
+                    """
+                    time.sleep(1) # 避免 API 呼叫過快
                 
-                status.update(label="🎉 所有文獻分析完成！", state="complete")
+                st.session_state.analyzed_count = len(articles)
+                status.update(label="🎉 分析完成！請查看下方結果或寄出郵件。", state="complete")
+                st.session_state.run_analysis = False # 任務結束
+
+# 寄信按鈕區 (只要有分析結果就會顯示)
+if st.session_state.analyzed_count > 0:
+    st.divider()
+    st.markdown("### 📧 彙整與分享")
+    st.info("如果您滿意上方的分析結果，點擊下方按鈕將其寄到您的信箱。")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("📩 立即寄出彙整報告", type="primary"):
+            if not email_password:
+                st.error("❌ 尚未設定 Gmail 應用程式密碼，無法寄信。請在側邊欄輸入。")
+            else:
+                with st.spinner("正在寄信中..."):
+                    success, msg = send_email_via_gmail(user_email, email_password, st.session_state.email_content)
+                    if success:
+                        st.success(f"✅ {msg} 請檢查收件匣！")
+                    else:
+                        st.error(msg)
