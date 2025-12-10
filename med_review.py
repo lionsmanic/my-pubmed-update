@@ -5,11 +5,11 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import time
-import requests # 引入 requests 庫
+import requests
 import json
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="GynOnc 文獻智庫", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="GynOnc 文獻智庫 (Auto-Detect)", page_icon="🧬", layout="wide")
 
 # --- Session State 初始化 ---
 if 'email_content' not in st.session_state:
@@ -19,10 +19,26 @@ if 'analyzed_count' not in st.session_state:
 if 'run_analysis' not in st.session_state:
     st.session_state.run_analysis = False
 
+# --- 核心函數：取得可用模型清單 ---
+def get_available_models(api_key):
+    """直接詢問 Google 這把 Key 能用哪些模型"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            # 過濾出支援 generateContent 的模型
+            models = [m['name'].replace('models/', '') for m in data.get('models', []) 
+                      if 'generateContent' in m.get('supportedGenerationMethods', [])]
+            return models
+        else:
+            return []
+    except:
+        return []
+
 # --- 側邊欄 ---
 with st.sidebar:
-    st.header("⚙️ 設定")
-    st.info("💡 模式：直接 API 連線 (無套件依賴)")
+    st.header("⚙️ 設定與模型偵測")
     
     # 1. API Key
     if 'GEMINI_API_KEY' in st.secrets:
@@ -30,6 +46,30 @@ with st.sidebar:
         st.success("🔑 API Key 已載入")
     else:
         api_key = st.text_input("Gemini API Key", type="password")
+
+    # --- 關鍵修改：模型選擇器 ---
+    selected_model_name = None
+    if api_key:
+        with st.spinner("正在偵測可用模型..."):
+            available_models = get_available_models(api_key)
+        
+        if available_models:
+            # 優先尋找 flash 或 pro，否則選第一個
+            default_ix = 0
+            if 'gemini-1.5-flash' in available_models:
+                default_ix = available_models.index('gemini-1.5-flash')
+            elif 'gemini-pro' in available_models:
+                default_ix = available_models.index('gemini-pro')
+                
+            selected_model_name = st.selectbox(
+                "✅ 偵測到您的可用模型 (請選擇):", 
+                available_models, 
+                index=default_ix
+            )
+            st.caption(f"目前使用: {selected_model_name}")
+        else:
+            st.error("❌ 無法取得模型清單。請確認 API Key 是否正確，或是否已在 Google AI Studio 啟用 API。")
+    # ---------------------------
 
     # 2. Email
     if 'EMAIL_ADDRESS' in st.secrets:
@@ -81,7 +121,8 @@ with st.sidebar:
     days_back = st.slider("搜尋過去幾天?", 1, 60, 7)
     max_results = st.slider("篇數上限", 1, 10, 3)
     
-    if st.button("🚀 開始搜尋與分析", type="primary"):
+    # 只有當選到了模型才允許執行
+    if st.button("🚀 開始搜尋與分析", type="primary", disabled=(not selected_model_name)):
         st.session_state.run_analysis = True
         st.session_state.email_content = ""
         st.session_state.analyzed_count = 0
@@ -122,13 +163,12 @@ def fetch_data(query, days, limit, email):
     except Exception as e:
         st.error(f"PubMed Error: {e}"); return []
 
-def run_ai_direct_api(art, key):
+def run_ai_direct_api(art, key, model_name):
     """
-    不使用 SDK，直接呼叫 Google REST API。
-    這可以避開所有套件版本問題。
+    使用使用者選擇的模型名稱進行分析
     """
-    # 這裡直接指定 API 網址，使用 flash 模型
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    # 這裡使用選擇的模型名稱
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
     
     headers = {'Content-Type': 'application/json'}
     
@@ -166,11 +206,10 @@ def run_ai_direct_api(art, key):
         
         if response.status_code == 200:
             result = response.json()
-            # 解析回傳的 JSON
             try:
                 return result['candidates'][0]['content']['parts'][0]['text']
             except:
-                return f"<div style='color:red'>❌ AI 回傳格式無法解析: {str(result)}</div>"
+                return f"<div style='color:red'>❌ AI 回傳格式異常</div>"
         else:
             return f"<div style='color:red'>❌ API 請求失敗 (Code {response.status_code}): {response.text}</div>"
             
@@ -194,10 +233,11 @@ def send_mail(to, pwd, html):
     except Exception as e: return False, str(e)
 
 # --- 主程式 ---
-st.title("🧬 GynOnc 文獻智庫 (Direct API)")
+st.title("🧬 GynOnc 文獻智庫 (Auto-Select)")
 
 if st.session_state.run_analysis:
     if not api_key: st.warning("請輸入 API Key")
+    elif not selected_model_name: st.warning("⚠️ 尚未選擇模型，請檢查側邊欄")
     elif not final_keywords: st.warning("請選擇關鍵字")
     else:
         with st.status("🔄 處理中...", expanded=True) as status:
@@ -216,8 +256,8 @@ if st.session_state.run_analysis:
                 for i, art in enumerate(arts):
                     st.write(f"🤖 分析 #{i+1}...")
                     
-                    # 改用直接連線函數
-                    ai_html = run_ai_direct_api(art, api_key)
+                    # 傳入使用者選擇的模型
+                    ai_html = run_ai_direct_api(art, api_key, selected_model_name)
                     
                     with cont:
                         st.subheader(f"{i+1}. {art['title']}")
