@@ -1,12 +1,12 @@
 import streamlit as st
-import google.generativeai as genai
 from Bio import Entrez
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import time
-import importlib.metadata
+import requests # 引入 requests 庫
+import json
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="GynOnc 文獻智庫", page_icon="🧬", layout="wide")
@@ -21,24 +21,13 @@ if 'run_analysis' not in st.session_state:
 
 # --- 側邊欄 ---
 with st.sidebar:
-    st.header("⚙️ 設定與診斷")
+    st.header("⚙️ 設定")
+    st.info("💡 模式：直接 API 連線 (無套件依賴)")
     
-    # 顯示套件版本
-    try:
-        ver = importlib.metadata.version('google-generativeai')
-        if ver >= "0.7.0":
-            st.success(f"✅ 套件版本 OK: {ver}")
-        else:
-            st.error(f"⚠️ 套件版本過舊: {ver}\n請刪除 App 重新部署！")
-    except:
-        st.warning("無法偵測版本")
-
-    st.divider()
-
     # 1. API Key
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
-        st.info("🔑 API Key 已載入 (Secrets)")
+        st.success("🔑 API Key 已載入")
     else:
         api_key = st.text_input("Gemini API Key", type="password")
 
@@ -133,64 +122,60 @@ def fetch_data(query, days, limit, email):
     except Exception as e:
         st.error(f"PubMed Error: {e}"); return []
 
-def run_ai_robust(art, key):
-    # 自動嘗試多種模型名稱
-    models_to_try = [
-        'gemini-1.5-flash', 
-        'gemini-1.5-flash-latest', 
-        'gemini-1.5-pro',
-        'gemini-pro',       # 舊版模型 (備用)
-        'gemini-1.0-pro'    # 舊版別名 (備用)
-    ]
+def run_ai_direct_api(art, key):
+    """
+    不使用 SDK，直接呼叫 Google REST API。
+    這可以避開所有套件版本問題。
+    """
+    # 這裡直接指定 API 網址，使用 flash 模型
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
     
-    genai.configure(api_key=key)
+    headers = {'Content-Type': 'application/json'}
     
-    selected_model = None
-    last_error = ""
+    prompt_text = f"""
+    角色：婦科腫瘤專家。請將以下摘要轉成繁體中文臨床重點 (HTML)。
     
-    # 迴圈測試哪個模型可用
-    for model_name in models_to_try:
-        try:
-            m = genai.GenerativeModel(model_name)
-            # 測試連線
-            m.generate_content("test")
-            selected_model = m
-            # st.toast(f"成功連線模型: {model_name}") # 除錯用
-            break
-        except Exception as e:
-            last_error = str(e)
-            continue
-            
-    if not selected_model:
-        return f"<div style='color:red; border:1px solid red; padding:10px;'>❌ 所有模型皆失敗。最後錯誤: {last_error}<br>請務必刪除 App 重新部署以更新環境。</div>"
-
-    # 正式分析
+    標題：{art['title']}
+    摘要：{art['abstract']}
+    
+    輸出 HTML (不含markdown, 僅內容):
+    <div style="background:#f9f9f9; padding:15px; border-left:4px solid #007bff; margin-bottom:10px;">
+        <h4 style="color:#0056b3; margin-top:0;">📝 重點摘要</h4>
+        <ul>
+            <li><b>背景</b>: ...</li>
+            <li><b>結果</b>: (含數據)...</li>
+            <li><b>結論</b>: ...</li>
+        </ul>
+        <h4 style="color:#d35400;">💡 臨床洞察</h4>
+        <ul>
+            <li><b>發想緣起</b>: ...</li>
+            <li><b>臨床運用</b>: ...</li>
+            <li><b>未來機會</b>: ...</li>
+        </ul>
+    </div>
+    """
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_text}]
+        }]
+    }
+    
     try:
-        prompt = f"""
-        角色：婦科腫瘤專家。請將以下摘要轉成繁體中文臨床重點 (HTML)。
-        標題：{art['title']}
-        摘要：{art['abstract']}
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
         
-        輸出 HTML (不含markdown):
-        <div style="background:#f9f9f9; padding:15px; border-left:4px solid #007bff; margin-bottom:10px;">
-            <h4 style="color:#0056b3; margin-top:0;">📝 重點摘要</h4>
-            <ul>
-                <li><b>背景</b>: ...</li>
-                <li><b>結果</b>: (含數據)...</li>
-                <li><b>結論</b>: ...</li>
-            </ul>
-            <h4 style="color:#d35400;">💡 臨床洞察</h4>
-            <ul>
-                <li><b>發想緣起</b>: ...</li>
-                <li><b>臨床運用</b>: ...</li>
-                <li><b>未來機會</b>: ...</li>
-            </ul>
-        </div>
-        """
-        res = selected_model.generate_content(prompt)
-        return res.text
+        if response.status_code == 200:
+            result = response.json()
+            # 解析回傳的 JSON
+            try:
+                return result['candidates'][0]['content']['parts'][0]['text']
+            except:
+                return f"<div style='color:red'>❌ AI 回傳格式無法解析: {str(result)}</div>"
+        else:
+            return f"<div style='color:red'>❌ API 請求失敗 (Code {response.status_code}): {response.text}</div>"
+            
     except Exception as e:
-        return f"<div style='color:red;'>❌ 分析中斷: {str(e)}</div>"
+        return f"<div style='color:red'>❌ 連線錯誤: {str(e)}</div>"
 
 def send_mail(to, pwd, html):
     msg = MIMEMultipart()
@@ -209,7 +194,7 @@ def send_mail(to, pwd, html):
     except Exception as e: return False, str(e)
 
 # --- 主程式 ---
-st.title("🧬 GynOnc 文獻智庫")
+st.title("🧬 GynOnc 文獻智庫 (Direct API)")
 
 if st.session_state.run_analysis:
     if not api_key: st.warning("請輸入 API Key")
@@ -230,8 +215,9 @@ if st.session_state.run_analysis:
                 
                 for i, art in enumerate(arts):
                     st.write(f"🤖 分析 #{i+1}...")
-                    # 使用新的 robust 函數
-                    ai_html = run_ai_robust(art, api_key)
+                    
+                    # 改用直接連線函數
+                    ai_html = run_ai_direct_api(art, api_key)
                     
                     with cont:
                         st.subheader(f"{i+1}. {art['title']}")
