@@ -8,10 +8,10 @@ import time
 import requests
 import json
 import concurrent.futures
-from deep_translator import GoogleTranslator # 引入 Google 翻譯
+from deep_translator import GoogleTranslator
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="GynOnc 極速版 v10", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="GynOnc 文獻系統 v11.0", page_icon="💎", layout="wide")
 
 # --- Session State ---
 if 'articles_data' not in st.session_state: st.session_state.articles_data = []
@@ -23,9 +23,23 @@ if 'search_trigger' not in st.session_state: st.session_state.search_trigger = F
 def clean_input(text):
     return text.strip() if text else ""
 
+def get_available_models(api_key):
+    """偵測可用模型，避免 404"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            # 只抓支援 generateContent 的模型
+            models = [m['name'].replace('models/', '') for m in data.get('models', []) 
+                      if 'generateContent' in m.get('supportedGenerationMethods', [])]
+            return models
+        return []
+    except: return []
+
 # --- 側邊欄 ---
 with st.sidebar:
-    st.header("🚀 設定與購物車")
+    st.header("💎 設定與購物車")
     
     # 1. 購物車
     if st.session_state.email_queue:
@@ -46,13 +60,32 @@ with st.sidebar:
     
     st.divider()
 
-    # 2. API Key
+    # 2. API Key 與 模型選擇 (關鍵修正)
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
         st.success("🔑 API Key Ready")
     else:
         raw_key = st.text_input("Gemini API Key", type="password")
         api_key = clean_input(raw_key)
+
+    selected_model_name = None
+    if api_key:
+        with st.spinner("偵測可用模型中..."):
+            available_models = get_available_models(api_key)
+        
+        if available_models:
+            # 智慧預設選取
+            default_ix = 0
+            if 'gemini-1.5-flash' in available_models: 
+                default_ix = available_models.index('gemini-1.5-flash')
+            elif 'gemini-pro' in available_models: 
+                default_ix = available_models.index('gemini-pro')
+            
+            selected_model_name = st.selectbox("✅ 選擇模型 (避免404):", available_models, index=default_ix)
+        else:
+            st.error("❌ 無法取得模型清單 (Key 可能無效)")
+            # 強制 fallback，讓使用者可以手動試試看
+            selected_model_name = st.text_input("手動輸入模型", "gemini-pro")
 
     st.divider()
     
@@ -96,11 +129,10 @@ with st.sidebar:
 
     max_res = st.number_input("篇數上限", 1, 100, 20)
     
-    if st.button("🚀 極速搜尋", type="primary"):
-        if not api_key: st.error("請輸入 API Key")
-        else:
-            st.session_state.articles_data = []
-            st.session_state.search_trigger = True
+    # 按鈕啟用條件：要有 Key 也要有選到的模型
+    if st.button("🚀 極速搜尋", type="primary", disabled=(not selected_model_name)):
+        st.session_state.articles_data = []
+        st.session_state.search_trigger = True
 
 # --- 核心函數 ---
 
@@ -143,29 +175,23 @@ def fetch_headers(query, date_params, limit, email):
     except Exception as e:
         st.error(f"PubMed Error: {e}"); return []
 
-# --- 1. 極速 Google 翻譯 (不使用 AI，改用 deep-translator) ---
-
+# --- 1. Google Translate (極速) ---
 def google_translate_worker(art):
-    """單篇翻譯函數"""
     try:
-        # 使用 Google Translate 翻譯標題
         translator = GoogleTranslator(source='auto', target='zh-TW')
         zh = translator.translate(art['title'])
         art['title_zh'] = zh
-    except Exception:
-        art['title_zh'] = art['title'] # 失敗回傳原文
+    except:
+        art['title_zh'] = art['title']
     return art
 
 def batch_translate_google(articles):
-    """使用多執行緒呼叫 Google Translate"""
     results = []
-    # 開 10 個執行緒，因為 Google Translate 很輕量
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(google_translate_worker, art) for art in articles]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
     
-    # 簡單排序回原本順序
     title_map = {r['title']: r for r in results}
     final_ordered = []
     for art in articles:
@@ -173,14 +199,12 @@ def batch_translate_google(articles):
         else: final_ordered.append(art)
     return final_ordered
 
-# --- 2. 深度分析 (Robust Markdown 模式) ---
-
-def run_deep_analysis_robust(art, key):
+# --- 2. 深度分析 (動態模型 + Markdown) ---
+def run_deep_analysis_robust(art, key, model_name):
     """
-    不再使用 JSON，直接要求 AI 輸出 Markdown。
-    這是最不容易出錯的方式。
+    使用使用者選擇的 model_name，避免 404
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
     headers = {'Content-Type': 'application/json'}
     
     prompt = f"""
@@ -207,11 +231,11 @@ def run_deep_analysis_robust(art, key):
     
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
-        res = requests.post(url, headers=headers, data=json.dumps(payload))
-        if res.status_code == 200:
-            return res.json()['candidates'][0]['content']['parts'][0]['text']
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 200:
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
         else:
-            return f"❌ 分析失敗 (API Error {res.status_code})"
+            return f"❌ 分析失敗 (API Error {response.status_code})\n請嘗試在側邊欄切換其他模型。"
     except Exception as e: 
         return f"❌ 連線失敗: {str(e)}"
 
@@ -221,10 +245,8 @@ def send_mail(to, pwd, queue):
     msg['To'] = to
     msg['Subject'] = f"GynOnc Report {datetime.now().strftime('%Y-%m-%d')}"
     
-    # 組合 HTML Email
     body = "<html><body><h2>文獻報告</h2><hr>" 
     for item in queue:
-        # 將 Markdown 簡單轉為 HTML 格式供 Email 顯示
         html_content = item['raw_markdown'].replace('\n', '<br>').replace('### ', '<h3>').replace('**', '<b>')
         body += f"<h3>{item['title']}</h3><p>{item['link']}</p><div>{html_content}</div><hr>"
     body += "</body></html>"
@@ -238,19 +260,18 @@ def send_mail(to, pwd, queue):
 
 # --- 主流程 ---
 
-st.title("🚀 GynOnc 極速版 v10")
+st.title("💎 GynOnc 文獻系統 v11.0")
 
 if st.session_state.search_trigger:
     search_email = "lionsmanic@gmail.com"
     if 'EMAIL_ADDRESS' in st.secrets: search_email = st.secrets['EMAIL_ADDRESS']
     
-    with st.status("🚀 搜尋中 (使用 Google Translate)...", expanded=True) as status:
+    with st.status("🚀 Google 翻譯加速中...", expanded=True) as status:
         q = build_query(final_k, final_j, date_range_query)
         raw = fetch_headers(q, date_params, max_res, search_email)
         
         if raw:
-            st.write(f"✅ 找到 {len(raw)} 篇，正在進行 Google 翻譯...")
-            # 使用 Google Translate
+            st.write(f"✅ 找到 {len(raw)} 篇，翻譯標題...")
             final_list = batch_translate_google(raw)
             st.session_state.articles_data = final_list
             status.update(label="完成！", state="complete")
@@ -266,7 +287,6 @@ if st.session_state.articles_data:
             c1, c2 = st.columns([5, 1])
             with c1:
                 st.markdown(f"**{i+1}. {art['title']}**")
-                # 藍色大標題 (Google 翻譯結果)
                 st.markdown(f"<h4 style='color:#1a5276; margin-top:0;'>{art.get('title_zh', '...')}</h4>", unsafe_allow_html=True)
                 st.caption(f"📖 {art['journal']} | [Link]({art['link']})")
             
@@ -274,20 +294,19 @@ if st.session_state.articles_data:
                 if st.button("🔍 詳細分析", key=f"btn_{i}"):
                     with st.spinner("AI 分析中..."):
                         if art['id'] not in st.session_state.analysis_cache:
-                            # 執行 Robust Markdown 分析
-                            report = run_deep_analysis_robust(art, api_key)
+                            # 使用選定的模型進行分析
+                            report = run_deep_analysis_robust(art, api_key, selected_model_name)
                             st.session_state.analysis_cache[art['id']] = report
                             
                             st.session_state.email_queue.append({
                                 "title": art['title'],
                                 "link": art['link'],
-                                "raw_markdown": report # 儲存原始 Markdown 供寄信用
+                                "raw_markdown": report
                             })
                             st.rerun()
 
             if art['id'] in st.session_state.analysis_cache:
                 with st.expander("🩺 深度報告", expanded=True):
-                    # 直接渲染 Markdown，最穩定
                     st.markdown(st.session_state.analysis_cache[art['id']])
             st.markdown("---")
 
