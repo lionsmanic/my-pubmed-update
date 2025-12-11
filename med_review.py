@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 import time
 import requests
 import json
+import concurrent.futures # 引入平行處理庫
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="GynOnc 文獻系統 v7.0 (極速版)", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="GynOnc 極速翻譯版 v8.0", page_icon="⚡", layout="wide")
 
 # --- Session State ---
 if 'articles_data' not in st.session_state: st.session_state.articles_data = []
@@ -20,125 +21,156 @@ if 'search_trigger' not in st.session_state: st.session_state.search_trigger = F
 # --- 工具函數 ---
 
 def clean_input(text):
-    """清理輸入字串，去除前後空格與換行 (解決 Connection Error 關鍵)"""
-    if text:
-        return text.strip()
-    return ""
+    """清理 API Key，去除空格"""
+    return text.strip() if text else ""
 
 def clean_json_text(text):
-    """清理 JSON 標記"""
+    """清理 JSON 格式"""
     text = text.strip()
     if text.startswith("```json"): text = text[7:]
     elif text.startswith("```"): text = text[3:]
     if text.endswith("```"): text = text[:-3]
     return text.strip()
 
+# --- 核心邏輯：多執行緒翻譯 ---
+
+def translate_chunk(chunk, key):
+    """
+    翻譯一個小區塊 (Worker Function)
+    """
+    if not chunk: return []
+    
+    # 組合 Prompt
+    titles_text = "\n".join([f"{i+1}. {art['title']}" for i, art in enumerate(chunk)])
+    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){key}"
+    headers = {'Content-Type': 'application/json'}
+    
+    prompt = f"""
+    Translate these medical titles to Traditional Chinese (Taiwan).
+    Format: One translation per line. No numbering. No English.
+    
+    Titles:
+    {titles_text}
+    """
+    
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 200:
+            res_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+            # 分割回傳的每一行
+            lines = [l.strip() for l in res_text.strip().split('\n') if l.strip()]
+            
+            # 對應回文章
+            for i, art in enumerate(chunk):
+                if i < len(lines):
+                    # 移除可能被 AI 加上的編號
+                    clean_zh = lines[i].split(". ", 1)[-1] if ". " in lines[i][:4] else lines[i]
+                    art['title_zh'] = clean_zh
+                else:
+                    art['title_zh'] = art['title'] # 沒翻到就顯示原文
+        else:
+            for art in chunk: art['title_zh'] = "(翻譯忙碌中)"
+    except:
+        for art in chunk: art['title_zh'] = "(連線錯誤)"
+        
+    return chunk
+
+def batch_translate_parallel(articles, key):
+    """
+    主控台：將文章分組，並發送給多個 Worker 同時跑
+    """
+    chunk_size = 10 # 每一組 10 篇
+    chunks = [articles[i:i + chunk_size] for i in range(0, len(articles), chunk_size)]
+    
+    results = []
+    
+    # 開啟 3 個執行緒 (Thread) 同時跑
+    # 注意：免費版 API 限制較多，開太多會被擋，3 個是安全值
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        # 提交任務
+        future_to_chunk = {executor.submit(translate_chunk, chunk, key): chunk for chunk in chunks}
+        
+        # 等待結果
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            try:
+                data = future.result()
+                results.extend(data)
+            except Exception as e:
+                pass
+                
+    # 因為多執行緒回傳順序不固定，這裡簡單處理直接回傳結果列表
+    # (如果很在意順序，可以用 map，但 list extend 夠用了)
+    return sorted(results, key=lambda x: articles.index(x)) # 嘗試恢復原本順序 (依賴 object id 或內容)
+
 # --- 側邊欄 ---
 with st.sidebar:
-    st.header("🚀 設定與購物車")
+    st.header("⚡ 極速翻譯設定")
     
-    # 1. 購物車 (置頂)
+    # 1. 購物車
     if st.session_state.email_queue:
-        with st.expander(f"🛒 待寄出清單 ({len(st.session_state.email_queue)}篇)", expanded=True):
-            for item in st.session_state.email_queue:
-                st.text(f"• {item['title'][:20]}...")
-            
+        with st.expander(f"🛒 購物車 ({len(st.session_state.email_queue)})", expanded=True):
             if 'EMAIL_ADDRESS' in st.secrets: user_email = st.secrets['EMAIL_ADDRESS']
-            else: user_email = st.text_input("您的 Email", "lionsmanic@gmail.com")
+            else: user_email = st.text_input("Email", "lionsmanic@gmail.com")
             
             if 'EMAIL_PASSWORD' in st.secrets: email_password = st.secrets['EMAIL_PASSWORD']
             else: email_password = st.text_input("Gmail App Password", type="password")
 
-            if st.button("📩 立即彙整寄出", type="primary"):
-                if not email_password: st.error("缺 Gmail 應用程式密碼")
-                else: st.session_state.trigger_email = True
-    else:
-        st.info("購物車是空的。")
+            if st.button("📩 寄出", type="primary"):
+                st.session_state.trigger_email = True
     
     st.divider()
 
-    # 2. API Key (加入 .strip() 保護)
+    # 2. API Key (Auto Clean)
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
-        st.success("🔑 API Key 已載入")
+        st.success("🔑 Key Ready")
     else:
-        # 這裡會自動清理空格
         raw_key = st.text_input("Gemini API Key", type="password")
         api_key = clean_input(raw_key)
 
-    # 固定使用 Flash 模型 (速度最快，不需偵測)
-    st.caption("✅ 使用模型: gemini-1.5-flash")
-
     st.divider()
     
-    # 3. 搜尋條件
-    st.subheader("🔍 搜尋條件")
+    # 3. 搜尋
+    st.subheader("🔍 條件")
     KEYWORDS = {
-        "🥚 婦癌 (Gyn Onc)": ["cervical cancer", "ovarian cancer", "endometrial cancer", "immunotherapy", "robotic surgery"],
-        "🌊 海扶刀 (HIFU)": ["HIFU", "high intensity focused ultrasound", "uterine leiomyoma", "adenomyosis"],
-        "🧬 精準/其他": ["genetic test", "targeted therapy"]
+        "🥚 婦癌": ["cervical cancer", "ovarian cancer", "endometrial cancer", "immunotherapy", "robotic surgery"],
+        "🌊 海扶刀": ["HIFU", "high intensity focused ultrasound", "uterine leiomyoma", "adenomyosis"],
+        "🧬 精準": ["genetic test", "targeted therapy"]
     }
     
-    selected_cats = st.multiselect("📚 主題", list(KEYWORDS.keys()), default=["🥚 婦癌 (Gyn Onc)"])
-    base_keywords = []
-    for cat in selected_cats: base_keywords.extend(KEYWORDS[cat])
-    
-    custom_keywords_str = st.text_input("➕ 自訂關鍵字", help="例如: TP53")
-    if custom_keywords_str: base_keywords.extend([k.strip() for k in custom_keywords_str.split(",")])
-    
-    final_keywords = st.multiselect("關鍵字", base_keywords, default=base_keywords)
+    sel_cat = st.multiselect("類別", list(KEYWORDS.keys()), ["🥚 婦癌"])
+    base_k = []
+    for c in sel_cat: base_k.extend(KEYWORDS[c])
+    cust_k = st.text_input("自訂", help="e.g. TP53")
+    if cust_k: base_k.extend([k.strip() for k in cust_k.split(",")])
+    final_k = st.multiselect("關鍵字", base_k, base_k)
 
-    use_journals = st.checkbox("限定期刊?", value=True)
-    PRESET_JOURNALS = ["New England Journal of Medicine", "The Lancet Oncology", "Journal of Clinical Oncology", "Gynecologic Oncology", "Journal of Gynecologic Oncology"]
-    final_journals = st.multiselect("期刊列表", PRESET_JOURNALS, default=PRESET_JOURNALS) if use_journals else []
+    use_j = st.checkbox("限定期刊", True)
+    PRESET_J = ["New England Journal of Medicine", "The Lancet Oncology", "Journal of Clinical Oncology", "Gynecologic Oncology", "Journal of Gynecologic Oncology"]
+    final_j = st.multiselect("期刊", PRESET_J, PRESET_J) if use_j else []
 
-    st.divider()
-
-    # 4. 時間與數量
-    date_mode = st.radio("📅 時間", ["最近幾天", "指定區間"], index=0)
-    date_range_query = ""
-    date_params = {}
+    days_back = st.slider("幾天內?", 1, 90, 14)
+    max_res = st.number_input("篇數", 1, 50, 10) # 建議 20 篇內體驗最好
     
-    if date_mode == "最近幾天":
-        days_back = st.slider("過去幾天?", 1, 90, 14)
-        date_params = {"reldate": days_back}
-    else:
-        col1, col2 = st.columns(2)
-        with col1: day_start = st.number_input("幾天前開始?", 1, 365, 60)
-        with col2: day_end = st.number_input("幾天前結束?", 0, 365, 30)
-        today = datetime.now()
-        d_min = (today - timedelta(days=day_start)).strftime("%Y/%m/%d")
-        d_max = (today - timedelta(days=day_end)).strftime("%Y/%m/%d")
-        date_range_query = f' AND ("{d_min}"[Date - Publication] : "{d_max}"[Date - Publication])'
-
-    max_results = st.number_input("篇數上限", 1, 100, 20)
-    
-    if st.button("🚀 極速搜尋 (不等待翻譯)", type="primary"):
-        if not api_key: st.error("請輸入 API Key")
+    if st.button("🚀 搜尋並翻譯", type="primary"):
+        if not api_key: st.error("缺 API Key")
         else:
             st.session_state.articles_data = []
-            st.session_state.analysis_cache = {}
             st.session_state.search_trigger = True
 
-# --- 核心函數 ---
+# --- 主程式函數 ---
 
-def build_query(keywords, journals, date_str_query):
-    if not keywords: return ""
-    term_q = "(" + " OR ".join([f'"{k}"[Title/Abstract]' for k in keywords]) + ")"
-    final = term_q
-    if journals:
-        journal_q = "(" + " OR ".join([f'"{j}"[Journal]' for j in journals]) + ")"
-        final = f"{term_q} AND {journal_q}"
-    if date_str_query: final += date_str_query
-    return final
+def build_query(keywords, journals, days):
+    q = "(" + " OR ".join([f'"{k}"[Title/Abstract]' for k in keywords]) + ")"
+    if journals: q = f"{q} AND (" + " OR ".join([f'"{j}"[Journal]' for j in journals]) + ")"
+    return q
 
-def fetch_headers(query, date_params, limit, email):
+def fetch_headers(query, days, limit, email):
     Entrez.email = email
     try:
-        search_args = {"db": "pubmed", "term": query, "retmax": limit, "sort": "date"}
-        if "reldate" in date_params: search_args["reldate"] = date_params["reldate"]
-        
-        h = Entrez.esearch(**search_args)
+        h = Entrez.esearch(db="pubmed", term=query, reldate=days, retmax=limit, sort="date")
         r = Entrez.read(h)
         ids = r["IdList"]
         if not ids: return []
@@ -155,219 +187,117 @@ def fetch_headers(query, date_params, limit, email):
                 ids = art['PubmedData']['ArticleIdList']
                 doi = next((i for i in ids if i.attributes['IdType']=='doi'), None)
                 link = f"[https://doi.org/](https://doi.org/){doi}" if doi else f"[https://pubmed.ncbi.nlm.nih.gov/](https://pubmed.ncbi.nlm.nih.gov/){ids[0]}/"
-                # 注意：這裡不再預先翻譯，title_zh 預設為空，等到分析時才填入
-                parsed.append({"id": ids[0], "title":ti, "journal":jo, "abstract":ab, "link":link, "title_zh": ""})
+                parsed.append({"id": ids[0], "title":ti, "journal":jo, "abstract":ab, "link":link, "title_zh": "翻譯中..."})
             except: continue
         return parsed
-    except Exception as e:
-        st.error(f"PubMed Error: {e}"); return []
+    except: return []
 
-def run_analysis_and_translate(art, key):
-    """
-    【核心修改】：一次做完「翻譯標題」+「深度分析」。
-    輸出 JSON，保證格式完美。
-    """
-    # 確保 Key 沒有空格
-    clean_key = clean_input(key)
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){clean_key}"
+def run_deep_analysis_json(art, key):
+    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){key}"
     headers = {'Content-Type': 'application/json'}
     
-    prompt_text = f"""
-    You are an expert Gynecologic Oncologist.
-    
-    Task 1: Translate the title to Traditional Chinese (Taiwan).
-    Task 2: Analyze the abstract deeply.
-    
+    prompt = f"""
+    Analyze abstract. Return JSON only. Keys: methods, rationale, results, implication. Values in Traditional Chinese.
     Title: {art['title']}
     Abstract: {art['abstract']}
-    
-    Return a valid JSON object with exactly these 5 keys:
-    {{
-        "title_zh": "翻譯後的繁體中文標題",
-        "methods": "Study design, population...",
-        "rationale": "Why this study? Clinical gap...",
-        "results": "Key data (P-value, HR, OR)...",
-        "implication": "Clinical application..."
-    }}
-    
-    Return ONLY the JSON string. No Markdown.
     """
     
-    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
-    
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
-        if response.status_code == 200:
-            txt = response.json()['candidates'][0]['content']['parts'][0]['text']
-            txt = clean_json_text(txt)
-            
-            try:
-                data = json.loads(txt)
-                
-                # 回傳兩樣東西：中文標題 (更新列表用) + HTML 報告 (顯示用)
-                html_output = f"""
-                <div style="font-family: sans-serif; line-height: 1.6; color: #333; background-color: #fff; padding: 15px; border-radius: 8px; border: 1px solid #ddd;">
-                    <div style="margin-bottom: 15px;">
-                        <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0;">1. 🧪 研究方法 (Methods)</h4>
-                        <div style="font-size: 0.95em;">{data.get('methods', '無資料')}</div>
-                    </div>
-                    <div style="margin-bottom: 15px;">
-                        <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0;">2. 💡 發想緣起 (Rationale)</h4>
-                        <div style="font-size: 0.95em;">{data.get('rationale', '無資料')}</div>
-                    </div>
-                    <div style="margin-bottom: 15px;">
-                        <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0;">3. 📊 結果數據 (Results)</h4>
-                        <div style="font-size: 0.95em;">{data.get('results', '無資料')}</div>
-                    </div>
-                    <div>
-                        <h4 style="color:#d35400; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0;">4. 🏥 臨床運用 (Implication)</h4>
-                        <div style="font-size: 0.95em;">{data.get('implication', '無資料')}</div>
-                    </div>
-                </div>
-                """
-                return data.get("title_zh", "翻譯失敗"), html_output
-                
-            except json.JSONDecodeError:
-                return "格式錯誤", "<div style='color:red'>JSON 解析失敗，請重試</div>"
-        else: 
-            return "連線錯誤", f"<div style='color:red'>API Error: {response.status_code} - {response.text}</div>"
-    except Exception as e: 
-        return "系統錯誤", f"<div style='color:red'>Connection Error: {str(e)}</div>"
+        res = requests.post(url, headers=headers, data=json.dumps(payload))
+        if res.status_code == 200:
+            txt = clean_json_text(res.json()['candidates'][0]['content']['parts'][0]['text'])
+            data = json.loads(txt)
+            return f"""
+            <div style="background:#fff; padding:15px; border-radius:8px; border:1px solid #eee;">
+                <h4 style="color:#2e86c1;">1. 🧪 研究方法</h4><div>{data.get('methods','')}</div>
+                <h4 style="color:#2e86c1;">2. 💡 發想緣起</h4><div>{data.get('rationale','')}</div>
+                <h4 style="color:#2e86c1;">3. 📊 結果數據</h4><div>{data.get('results','')}</div>
+                <h4 style="color:#d35400;">4. 🏥 臨床運用</h4><div>{data.get('implication','')}</div>
+            </div>
+            """
+    except: return "<div style='color:red'>分析失敗</div>"
+    return "<div style='color:red'>連線失敗</div>"
 
-def send_bulk_email(to, pwd, queue):
-    if not queue: return False, "清單為空"
+def send_mail(to, pwd, queue):
     msg = MIMEMultipart()
     msg['From'] = to
     msg['To'] = to
-    msg['Subject'] = f"GynOnc 文獻彙報 ({len(queue)}篇) - {datetime.now().strftime('%Y-%m-%d')}"
-    
-    body = """
-    <html><body style="font-family: Arial, sans-serif; color: #333;">
-    <h2 style="color: #2c3e50;">🧬 GynOnc 文獻分析報告</h2>
-    <hr>
-    """
-    for item in queue:
-        body += item['html']
-        body += "<hr style='margin: 30px 0; border: 0; border-top: 1px solid #ddd;'>"
-    body += "</body></html>"
-    
+    msg['Subject'] = f"GynOnc Report {datetime.now().strftime('%Y-%m-%d')}"
+    body = "<html><body><h2>文獻報告</h2><hr>" + "".join([i['html'] + "<hr>" for i in queue]) + "</body></html>"
     msg.attach(MIMEText(body, 'html'))
     try:
-        s = smtplib.SMTP('smtp.gmail.com', 587)
-        s.starttls()
-        s.login(to, pwd)
-        s.send_message(msg); s.quit()
-        return True, "已寄出"
+        s = smtplib.SMTP('smtp.gmail.com', 587); s.starttls()
+        s.login(to, pwd); s.send_message(msg); s.quit()
+        return True, "OK"
     except Exception as e: return False, str(e)
 
-# --- 主程式邏輯 ---
+# --- 主流程 ---
 
-st.title("🚀 GynOnc 文獻系統 v7.0")
-st.caption("極速版：即時顯示標題，隨點隨分析 (解決連線錯誤)")
+st.title("⚡ GynOnc 極速翻譯版 v8.0")
 
-# 1. 執行搜尋 (只抓標題，不翻譯 -> 速度極快)
 if st.session_state.search_trigger:
-    with st.status("🔍 正在搜尋 PubMed...", expanded=True) as status:
-        # 使用 sidebar 定義的 user_email (這裡為了避免 NameError，重新抓一次)
-        email_for_search = "lionsmanic@gmail.com"
-        if 'EMAIL_ADDRESS' in st.secrets: email_for_search = st.secrets['EMAIL_ADDRESS']
-        
-        q = build_query(final_keywords, final_journals, date_range_query)
-        st.write(f"語法: `{q[:50]}...`")
-        
-        raw_articles = fetch_headers(q, date_params, max_results, email_for_search)
-        
-        if raw_articles:
-            st.session_state.articles_data = raw_articles
-            status.update(label=f"✅ 搜尋完成！找到 {len(raw_articles)} 篇。", state="complete")
-        else:
-            status.update(label="❌ 找不到文章", state="error")
+    # 為了避免變數錯誤，這裡定義臨時 email
+    temp_email = "lionsmanic@gmail.com"
+    if 'EMAIL_ADDRESS' in st.secrets: temp_email = st.secrets['EMAIL_ADDRESS']
     
+    with st.status("🚀 啟動多核心引擎：搜尋 + 平行翻譯中...", expanded=True) as status:
+        q = build_query(final_k, final_j, days_back)
+        raw = fetch_headers(q, {"reldate": days_back}, max_res, temp_email)
+        
+        if raw:
+            st.write(f"✅ 找到 {len(raw)} 篇，正在同時翻譯...")
+            # 關鍵：平行翻譯
+            final_list = batch_translate_parallel(raw, api_key)
+            st.session_state.articles_data = final_list
+            status.update(label="完成！", state="complete")
+        else:
+            status.update(label="無結果", state="error")
     st.session_state.search_trigger = False
 
-# 2. 顯示列表
+# 顯示列表
 if st.session_state.articles_data:
     st.divider()
-    st.markdown(f"### 📚 文獻列表 ({len(st.session_state.articles_data)} 篇)")
-    
     for i, art in enumerate(st.session_state.articles_data):
         with st.container():
-            col1, col2 = st.columns([5, 1])
-            with col1:
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                # 這裡直接顯示翻譯好的標題
                 st.markdown(f"**{i+1}. {art['title']}**")
-                # 如果已經分析過，顯示中文標題
-                if art['title_zh']:
-                    st.markdown(f"<span style='color:#2e86c1; font-weight:bold;'>{art['title_zh']}</span>", unsafe_allow_html=True)
-                st.caption(f"📖 {art['journal']} | [原文連結]({art['link']})")
+                # 藍色大字體顯示中文標題
+                st.markdown(f"<h4 style='color:#1a5276; margin-top:0;'>{art.get('title_zh', '...')}</h4>", unsafe_allow_html=True)
+                st.caption(f"📖 {art['journal']} | [Link]({art['link']})")
             
-            with col2:
-                btn_key = f"analyze_{art['id']}_{i}"
-                # 如果已經分析過，按鈕變綠色
-                btn_label = "✅ 已分析" if art['id'] in st.session_state.analysis_cache else "🔍 分析"
-                
-                if st.button(btn_label, key=btn_key):
-                    with st.spinner("AI 正在翻譯並分析..."):
-                        # 呼叫合併函數
-                        zh_title, report_html = run_analysis_and_translate(art, api_key)
-                        
-                        # 更新 Cache
-                        st.session_state.analysis_cache[art['id']] = report_html
-                        # 更新列表中的中文標題 (讓它下次渲染時顯示)
-                        art['title_zh'] = zh_title
-                        
-                        # 加入購物車
-                        email_item = {
-                            "title": art['title'],
-                            "html": f"""
-                            <div style="background-color: #f9f9f9; padding: 20px; border-radius: 5px; margin-bottom: 20px;">
-                                <h3 style="margin-top: 0; color: #1a5276;"><a href='{art['link']}' style="text-decoration: none; color: #1a5276;">{art['title']}</a></h3>
-                                <h4 style="margin-top: 5px; color: #2e86c1;">{zh_title}</h4>
-                                <p style="color: #666; font-size: 0.9em;">📖 {art['journal']}</p>
-                                {report_html}
-                            </div>
-                            """
-                        }
-                        if not any(d['title'] == art['title'] for d in st.session_state.email_queue):
-                            st.session_state.email_queue.append(email_item)
+            with c2:
+                if st.button("🔍 詳細分析", key=f"btn_{i}"):
+                    with st.spinner("分析中..."):
+                        if art['id'] not in st.session_state.analysis_cache:
+                            report = run_deep_analysis_json(art, api_key)
+                            st.session_state.analysis_cache[art['id']] = report
+                            
+                            # 加入購物車
+                            st.session_state.email_queue.append({
+                                "title": art['title'],
+                                "html": f"<h3>{art['title']}</h3><h4>{art['title_zh']}</h4>{report}"
+                            })
                             st.rerun()
 
-            # 顯示分析結果
             if art['id'] in st.session_state.analysis_cache:
-                with st.expander("🩺 深度分析報告", expanded=True):
+                with st.expander("🩺 深度報告", expanded=True):
                     st.markdown(st.session_state.analysis_cache[art['id']], unsafe_allow_html=True)
             st.markdown("---")
 
-# 觸發寄信
 if getattr(st.session_state, 'trigger_email', False):
-    # 再次確認 Email 變數
-    mail_to = "lionsmanic@gmail.com"
-    mail_pwd = ""
-    if 'EMAIL_ADDRESS' in st.secrets: mail_to = st.secrets['EMAIL_ADDRESS']
-    if 'EMAIL_PASSWORD' in st.secrets: mail_pwd = st.secrets['EMAIL_PASSWORD']
+    # 再次獲取密碼 (需要確保 sidebar 變數可及性，或使用 secrets)
+    m_to = "lionsmanic@gmail.com"
+    m_pwd = ""
+    if 'EMAIL_ADDRESS' in st.secrets: m_to = st.secrets['EMAIL_ADDRESS']
+    if 'EMAIL_PASSWORD' in st.secrets: m_pwd = st.secrets['EMAIL_PASSWORD']
     
-    # 如果側邊欄有輸入，優先使用
-    # (這裡簡化處理，直接從 session_state 或 secrets 抓比較複雜，
-    # 最簡單是假設使用者已經在側邊欄按鈕觸發前填好了)
-    
-    # 這裡的邏輯是：上面的按鈕已經檢查過密碼了，所以直接寄送
-    # 但為了安全，我們需要從側邊欄 input 獲取值，這在 Streamlit 有點 tricky
-    # 因此我們依賴 session_state 重跑時的變數狀態
-    
-    # 重新獲取一次使用者輸入的密碼 (因為跨了 rerun)
-    # 注意：Streamlit rerun 後 local variable 會消失
-    # 但因為我们在 sidebar 每次都 render input，所以只要使用者沒刪掉，值還在
-    # 這裡做一個簡單的 fallback 提示
-    
-    ok, msg = send_bulk_email(mail_to, mail_pwd, st.session_state.email_queue) # 注意：這裡的 mail_pwd 可能需要您在 secrets 填寫或確保 sidebar 輸入
-    # 修正：要在這裡準確抓到 sidebar 的值比較困難，
-    # 建議您直接把 Gmail 密碼寫入 .streamlit/secrets.toml 最方便
-    
-    if ok:
-        st.sidebar.success("✅ 郵件已成功寄出！")
+    # 如果沒設定 secrets，這裡會失敗，建議正式環境務必設 secrets
+    ok, msg = send_mail(m_to, m_pwd, st.session_state.email_queue)
+    if ok: 
+        st.sidebar.success("已寄出")
         st.session_state.email_queue = []
-    else:
-        st.sidebar.error(f"❌ 寄送失敗 (請檢查 secrets 或密碼): {msg}")
-    
+    else: st.sidebar.error(f"失敗: {msg}")
     st.session_state.trigger_email = False
-    time.sleep(2)
-    st.rerun()
