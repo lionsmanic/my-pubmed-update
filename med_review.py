@@ -9,17 +9,17 @@ import requests
 import json
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="GynOnc 文獻智庫 v3.0", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="GynOnc 文獻快篩系統 v4.0", page_icon="⚡", layout="wide")
 
-# --- Session State 初始化 ---
-if 'email_content' not in st.session_state:
-    st.session_state.email_content = ""
-if 'analyzed_count' not in st.session_state:
-    st.session_state.analyzed_count = 0
-if 'run_analysis' not in st.session_state:
-    st.session_state.run_analysis = False
+# --- Session State 初始化 (關鍵：用於記住搜尋結果與分析緩存) ---
+if 'articles_data' not in st.session_state:
+    st.session_state.articles_data = []  # 存搜尋到的所有文章簡介
+if 'analysis_cache' not in st.session_state:
+    st.session_state.analysis_cache = {} # 存已經分析過的詳細內容 {doi: html}
+if 'email_queue' not in st.session_state:
+    st.session_state.email_queue = []    # 準備寄出的清單
 
-# --- 核心函數：取得可用模型 ---
+# --- 核心函數：模型偵測 ---
 def get_available_models(api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
@@ -34,7 +34,7 @@ def get_available_models(api_key):
 
 # --- 側邊欄 ---
 with st.sidebar:
-    st.header("⚙️ 設定與模型")
+    st.header("⚡ 設定與快篩")
     
     # 1. API Key
     if 'GEMINI_API_KEY' in st.secrets:
@@ -46,23 +46,18 @@ with st.sidebar:
     # 模型選擇
     selected_model_name = None
     if api_key:
-        with st.spinner("偵測模型中..."):
-            available_models = get_available_models(api_key)
+        available_models = get_available_models(api_key)
         if available_models:
             default_ix = 0
-            if 'gemini-1.5-flash' in available_models:
-                default_ix = available_models.index('gemini-1.5-flash')
-            elif 'gemini-pro' in available_models:
-                default_ix = available_models.index('gemini-pro')
-            selected_model_name = st.selectbox("✅ 選擇模型:", available_models, index=default_ix)
-        else:
-            st.error("❌ 無法取得模型 (請檢查 Key)")
+            if 'gemini-1.5-flash' in available_models: default_ix = available_models.index('gemini-1.5-flash')
+            elif 'gemini-pro' in available_models: default_ix = available_models.index('gemini-pro')
+            selected_model_name = st.selectbox("✅ AI 模型:", available_models, index=default_ix)
 
     # 2. Email
     if 'EMAIL_ADDRESS' in st.secrets:
         user_email = st.secrets['EMAIL_ADDRESS']
     else:
-        user_email = st.text_input("您的 Email", "lionsmanic@gmail.com")
+        user_email = st.text_input("Email", "lionsmanic@gmail.com")
     
     if 'EMAIL_PASSWORD' in st.secrets:
         email_password = st.secrets['EMAIL_PASSWORD']
@@ -71,121 +66,84 @@ with st.sidebar:
 
     st.divider()
     
-    # 3. 搜尋設定 (升級版)
+    # 3. 搜尋設定
     st.subheader("🔍 搜尋條件")
     
-    # 預設選單
     KEYWORDS = {
-        "🥚 婦癌 (Gyn Onc)": ["cervical cancer", "ovarian cancer", "endometrial cancer", "immunotherapy", "robotic surgery", "sarcoma"],
-        "🌊 海扶刀 (HIFU)": ["HIFU", "high intensity focused ultrasound", "uterine leiomyoma", "adenomyosis", "fibroid"],
-        "🧬 精準/其他": ["genetic test", "targeted therapy", "pembrolizumab", "bevacizumab"]
+        "🥚 婦癌 (Gyn Onc)": ["cervical cancer", "ovarian cancer", "endometrial cancer", "immunotherapy", "robotic surgery"],
+        "🌊 海扶刀 (HIFU)": ["HIFU", "high intensity focused ultrasound", "uterine leiomyoma", "adenomyosis"],
+        "🧬 精準/其他": ["genetic test", "targeted therapy"]
     }
     
-    selected_cats = st.multiselect("📚 選擇主題類別", list(KEYWORDS.keys()), default=["🥚 婦癌 (Gyn Onc)"])
+    selected_cats = st.multiselect("📚 主題類別", list(KEYWORDS.keys()), default=["🥚 婦癌 (Gyn Onc)"])
     base_keywords = []
     for cat in selected_cats:
         base_keywords.extend(KEYWORDS[cat])
     
-    # 手動增加關鍵字
-    custom_keywords_str = st.text_input("➕ 手動增加關鍵字 (用逗號隔開)", help="例如: TP53, recurrence, toxicity")
+    custom_keywords_str = st.text_input("➕ 自訂關鍵字", help="例如: TP53, toxicity")
     if custom_keywords_str:
-        custom_kws = [k.strip() for k in custom_keywords_str.split(",") if k.strip()]
-        base_keywords.extend(custom_kws)
+        base_keywords.extend([k.strip() for k in custom_keywords_str.split(",") if k.strip()])
     
-    final_keywords = st.multiselect("✅ 確認最終關鍵字", base_keywords, default=base_keywords)
+    final_keywords = st.multiselect("最終關鍵字", base_keywords, default=base_keywords)
 
-    st.divider()
-    
-    # 期刊設定
-    PRESET_JOURNALS = ["New England Journal of Medicine", "The Lancet", "The Lancet Oncology", "Journal of Clinical Oncology", "Gynecologic Oncology", "Journal of Gynecologic Oncology", "Nature Medicine"]
-    use_journals = st.checkbox("限定期刊?", value=True)
-    final_journals = []
-    
-    if use_journals:
-        selected_journals = st.multiselect("選擇預設期刊", PRESET_JOURNALS, default=PRESET_JOURNALS)
-        # 手動增加期刊
-        custom_journals_str = st.text_input("➕ 手動增加期刊 (用逗號隔開)", help="例如: British Journal of Cancer")
-        if custom_journals_str:
-            custom_js = [j.strip() for j in custom_journals_str.split(",") if j.strip()]
-            selected_journals.extend(custom_js)
-        final_journals = selected_journals
+    use_journals = st.checkbox("限定權威期刊?", value=True)
+    PRESET_JOURNALS = ["New England Journal of Medicine", "The Lancet Oncology", "Journal of Clinical Oncology", "Gynecologic Oncology"]
+    final_journals = st.multiselect("選擇期刊", PRESET_JOURNALS, default=PRESET_JOURNALS) if use_journals else []
 
     st.divider()
 
-    # 4. 時間設定 (升級版：時間區段)
-    st.subheader("📅 時間區段設定")
-    date_mode = st.radio("時間模式", ["最近幾天", "指定過去區間"], index=0)
-    
+    # 4. 時間與數量
+    date_mode = st.radio("📅 時間模式", ["最近幾天", "指定區間"], index=0)
     date_range_query = ""
+    date_params = {}
     
     if date_mode == "最近幾天":
-        days_back = st.slider("搜尋過去幾天?", 1, 60, 7)
-        # 使用 reldate 邏輯 (在函數中處理)
+        days_back = st.slider("過去幾天?", 1, 90, 14)
         date_params = {"reldate": days_back}
-        display_date_info = f"過去 {days_back} 天"
     else:
         col1, col2 = st.columns(2)
-        with col1:
-            day_start = st.number_input("從幾天前開始?", min_value=1, value=60)
-        with col2:
-            day_end = st.number_input("到幾天前結束?", min_value=0, value=30)
-        
-        if day_start <= day_end:
-            st.error("開始天數必須大於結束天數 (例如：從 60 天前 到 30 天前)")
-            st.stop()
-            
-        # 計算日期字串 YYYY/MM/DD
+        with col1: day_start = st.number_input("幾天前開始?", 1, 365, 60)
+        with col2: day_end = st.number_input("幾天前結束?", 0, 365, 30)
         today = datetime.now()
-        date_min = (today - timedelta(days=day_start)).strftime("%Y/%m/%d")
-        date_max = (today - timedelta(days=day_end)).strftime("%Y/%m/%d")
-        
-        # PubMed 語法: "YYYY/MM/DD"[Date - Publication] : "YYYY/MM/DD"[Date - Publication]
-        date_range_query = f' AND ("{date_min}"[Date - Publication] : "{date_max}"[Date - Publication])'
-        date_params = {} # 這種模式下不用 reldate
-        display_date_info = f"{date_min} ~ {date_max}"
+        d_min = (today - timedelta(days=day_start)).strftime("%Y/%m/%d")
+        d_max = (today - timedelta(days=day_end)).strftime("%Y/%m/%d")
+        date_range_query = f' AND ("{d_min}"[Date - Publication] : "{d_max}"[Date - Publication])'
 
-    max_results = st.slider("篇數上限", 1, 10, 3)
+    # 數量設定 (0-100)
+    max_results = st.number_input("列出篇數上限 (Max Results)", min_value=1, max_value=100, value=20)
     
-    if st.button("🚀 開始搜尋與分析", type="primary", disabled=(not selected_model_name)):
-        st.session_state.run_analysis = True
-        st.session_state.email_content = ""
-        st.session_state.analyzed_count = 0
+    # 搜尋按鈕
+    if st.button("🚀 極速搜尋 (列出標題)", type="primary", disabled=(not selected_model_name)):
+        # 清空舊資料
+        st.session_state.articles_data = []
+        st.session_state.analysis_cache = {}
+        st.session_state.email_queue = []
+        st.session_state.search_trigger = True # 觸發搜尋標記
 
-# --- 核心功能 ---
+# --- 核心功能函數 ---
 
 def build_query(keywords, journals, date_str_query):
     if not keywords: return ""
     term_q = "(" + " OR ".join([f'"{k}"[Title/Abstract]' for k in keywords]) + ")"
-    
     final = term_q
     if journals:
         journal_q = "(" + " OR ".join([f'"{j}"[Journal]' for j in journals]) + ")"
         final = f"{term_q} AND {journal_q}"
-    
-    # 加上自訂的時間區間語法
-    if date_str_query:
-        final += date_str_query
-        
+    if date_str_query: final += date_str_query
     return final
 
-def fetch_data(query, date_params, limit, email):
+def fetch_headers(query, date_params, limit, email):
     Entrez.email = email
     try:
-        # 如果是 reldate 模式，參數會放在 kwargs
-        search_args = {
-            "db": "pubmed",
-            "term": query,
-            "retmax": limit,
-            "sort": "date"
-        }
-        if "reldate" in date_params:
-            search_args["reldate"] = date_params["reldate"]
-            
+        search_args = {"db": "pubmed", "term": query, "retmax": limit, "sort": "date"}
+        if "reldate" in date_params: search_args["reldate"] = date_params["reldate"]
+        
         h = Entrez.esearch(**search_args)
         r = Entrez.read(h)
         ids = r["IdList"]
         if not ids: return []
         
+        # 抓取摘要資訊
         h = Entrez.efetch(db="pubmed", id=ids, retmode="xml")
         arts = Entrez.read(h)
         parsed = []
@@ -198,68 +156,103 @@ def fetch_data(query, date_params, limit, email):
                 ids = art['PubmedData']['ArticleIdList']
                 doi = next((i for i in ids if i.attributes['IdType']=='doi'), None)
                 link = f"https://doi.org/{doi}" if doi else f"https://pubmed.ncbi.nlm.nih.gov/{ids[0]}/"
-                parsed.append({"title":ti, "journal":jo, "abstract":ab, "link":link})
+                parsed.append({"id": ids[0], "title":ti, "journal":jo, "abstract":ab, "link":link, "title_zh": "翻譯中..."})
             except: continue
         return parsed
     except Exception as e:
         st.error(f"PubMed Error: {e}"); return []
 
-def run_ai_direct_api(art, key, model_name):
+def batch_translate_titles(articles, key, model_name):
+    """
+    一次將所有標題打包送給 AI 翻譯 (批次處理，速度極快)
+    """
+    if not articles: return []
+    
+    # 準備 Prompt，將標題列表化
+    titles_text = "\n".join([f"{i+1}. {art['title']}" for i, art in enumerate(articles)])
+    
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
     headers = {'Content-Type': 'application/json'}
     
-    # 特殊指令：要求 AI 用 ||| 分隔「一句話簡介」與「詳細內容」
-    prompt_text = f"""
-    角色：資深婦科腫瘤醫師。
-    任務：分析以下文獻。
+    prompt = f"""
+    任務：將以下 {len(articles)} 個醫學論文標題翻譯成「台灣繁體中文」。
+    格式：請嚴格按照順序，一行一個翻譯結果，不要有編號，不要有額外文字。
     
-    標題：{art['title']}
-    摘要：{art['abstract']}
-    
-    【輸出格式要求 - 重要】：
-    請輸出兩部分，中間用 "|||" 三個直槓符號嚴格區隔。
-    
-    第一部分：一句最精鍊的中文簡述 (One-liner)，告訴我這篇在做什麼，類似新聞標題。
-    |||
-    第二部分：詳細分析報告 (HTML 格式，不含 markdown)。內容須包含：
-    1. 🧪 研究方法 (Methods): 簡述研究設計 (Retrospective? RCT? sample size?)
-    2. 💡 發想緣起 (Rationale): 作者為何做這個？解決什麼臨床痛點？
-    3. 📊 結果與數據 (Results): 重點 P 值、HR。
-    4. 🏥 臨床運用與結論 (Conclusion): 婦癌醫師如何應用？
-    
-    HTML 樣式：使用 <div> <ul> <li> <b> 等標籤。
+    原文標題：
+    {titles_text}
     """
     
-    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     
     try:
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         if response.status_code == 200:
-            result = response.json()
-            try:
-                full_text = result['candidates'][0]['content']['parts'][0]['text']
-                # 分割字串
-                parts = full_text.split("|||")
-                if len(parts) >= 2:
-                    summary = parts[0].strip()
-                    detail_html = parts[1].strip().replace("```html", "").replace("```", "")
-                    return summary, detail_html
+            res_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+            # 分割回傳的行
+            zh_titles = [line.strip() for line in res_text.strip().split('\n') if line.strip()]
+            
+            # 確保長度一致 (AI有時候會少翻或多編號)
+            for i, art in enumerate(articles):
+                if i < len(zh_titles):
+                    # 移除可能存在的編號 (如 "1. ")
+                    clean_title = zh_titles[i].split(". ", 1)[-1] if ". " in zh_titles[i][:4] else zh_titles[i]
+                    art['title_zh'] = clean_title
                 else:
-                    return "分析完成", full_text # fallback
-            except:
-                return "解析錯誤", "<div style='color:red'>AI 回傳格式異常</div>"
-        else:
-            return "連線錯誤", f"<div style='color:red'>API 請求失敗: {response.text}</div>"
-    except Exception as e:
-        return "系統錯誤", f"<div style='color:red'>錯誤: {str(e)}</div>"
+                    art['title_zh'] = "(翻譯失敗)"
+    except:
+        pass # 失敗就維持原樣
+    return articles
 
-def send_mail(to, pwd, html):
+def run_deep_analysis(art, key, model_name):
+    """單篇深度分析"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+    headers = {'Content-Type': 'application/json'}
+    
+    prompt_text = f"""
+    角色：資深婦癌權威醫師。
+    任務：針對以下這篇論文進行詳細的學術點評。
+    
+    標題：{art['title']}
+    摘要：{art['abstract']}
+    
+    請以 HTML 格式 (不含 markdown) 輸出以下結構分析：
+    <div style="background:#fff; padding:15px; border:1px solid #ddd; border-radius:5px;">
+        <h4 style="color:#2e86c1; margin-top:0;">1. 🧪 研究方法 (Methods)</h4>
+        <p>請簡述 Study Design, Patient Population, Intervention。</p>
+        
+        <h4 style="color:#2e86c1;">2. 💡 發想緣起 (Rationale)</h4>
+        <p>推測作者為何進行此研究？解決了什麼臨床痛點？</p>
+        
+        <h4 style="color:#2e86c1;">3. 📊 結果數據 (Results)</h4>
+        <p>請列出關鍵 P-value, HR, OR, Response Rate 等具體數據。</p>
+        
+        <h4 style="color:#d35400;">4. 🏥 臨床運用與結論 (Clinical Implication)</h4>
+        <p>這對婦癌臨床實踐有何具體改變或建議？</p>
+    </div>
+    """
+    
+    payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 200:
+            txt = response.json()['candidates'][0]['content']['parts'][0]['text']
+            return txt.replace("```html", "").replace("```", "")
+        else: return f"<div style='color:red'>分析失敗: {response.text}</div>"
+    except Exception as e: return f"<div style='color:red'>錯誤: {str(e)}</div>"
+
+def send_bulk_email(to, pwd, queue):
+    if not queue: return False, "清單為空"
     msg = MIMEMultipart()
     msg['From'] = to
     msg['To'] = to
-    msg['Subject'] = f"GynOnc Report {datetime.now().strftime('%Y-%m-%d')}"
-    full_html = f"<html><body style='font-family:Arial;'>{html}</body></html>"
-    msg.attach(MIMEText(full_html, 'html'))
+    msg['Subject'] = f"GynOnc 精選文獻彙報 ({len(queue)}篇) - {datetime.now().strftime('%Y-%m-%d')}"
+    
+    body = "<h2>🧬 您的精選文獻分析報告</h2><hr>"
+    for item in queue:
+        body += item['html']
+        body += "<hr>"
+    
+    msg.attach(MIMEText(body, 'html'))
     try:
         s = smtplib.SMTP('smtp.gmail.com', 587)
         s.starttls()
@@ -268,73 +261,86 @@ def send_mail(to, pwd, html):
         return True, "已寄出"
     except Exception as e: return False, str(e)
 
-# --- 主程式 ---
-st.title("🧬 GynOnc 文獻智庫 v3.0")
-st.caption("AI 驅動的婦科腫瘤精準文獻分析")
+# --- 主程式邏輯 ---
 
-if st.session_state.run_analysis:
-    if not api_key: st.warning("請輸入 API Key")
-    elif not selected_model_name: st.warning("請選擇模型")
-    else:
-        with st.status("🔄 智能處理中...", expanded=True) as status:
-            # 建構搜尋語法
-            q = build_query(final_keywords, final_journals, date_range_query)
-            st.write(f"📡 搜尋區間: `{display_date_info}`")
-            # st.code(q) # debug用
-            
-            arts = fetch_data(q, date_params, max_results, user_email)
-            
-            if not arts:
-                status.update(label="❌ 該時段無符合條件文章", state="error")
-                st.session_state.run_analysis = False
-            else:
-                st.write(f"✅ 找到 {len(arts)} 篇，AI 正在深入閱讀...")
-                st.session_state.email_content = ""
-                cont = st.container()
-                
-                for i, art in enumerate(arts):
-                    st.write(f"🤖 分析 #{i+1}: {art['title'][:30]}...")
-                    
-                    # 取得 簡述 和 詳細HTML
-                    summary, detail_html = run_ai_direct_api(art, api_key, selected_model_name)
-                    
-                    with cont:
-                        # 兩段式呈現
-                        st.markdown("---")
-                        # 第一段：標題 + 期刊 + 簡述
-                        st.subheader(f"#{i+1} {art['title']}")
-                        st.caption(f"📖 {art['journal']} | 🗓️ {display_date_info} | 🔗 [原文連結]({art['link']})")
-                        st.info(f"📌 **精華速讀**: {summary}")
-                        
-                        # 第二段：展開看詳細
-                        with st.expander("🩺 點擊查看：研究方法、發想緣起與詳細數據"):
-                            st.markdown(detail_html, unsafe_allow_html=True)
-                    
-                    # Email 內容：標題 + 簡述 + 詳細
-                    st.session_state.email_content += f"""
-                    <div style="margin-bottom: 30px; border: 1px solid #ddd; padding: 15px; border-radius: 8px;">
-                        <h3 style="color:#0056b3; margin-top:0;"><a href='{art['link']}'>{art['title']}</a></h3>
-                        <p style="color:#666; font-size:0.9em;">{art['journal']}</p>
-                        <div style="background:#eef6fc; padding:10px; border-radius:4px; margin-bottom:10px; color:#2c3e50; font-weight:bold;">
-                            📌 {summary}
-                        </div>
-                        {detail_html}
-                    </div>
-                    """
-                    time.sleep(1)
-                
-                st.session_state.analyzed_count = len(arts)
-                status.update(label="🎉 分析完成！", state="complete")
-                st.session_state.run_analysis = False
+st.title("⚡ GynOnc 文獻快篩系統")
+st.caption("先列清單，再點選深入分析")
 
-if st.session_state.analyzed_count > 0:
+# 1. 執行搜尋 (只抓標題和摘要，不做分析)
+if getattr(st.session_state, 'search_trigger', False):
+    with st.status("🔍 正在搜尋 PubMed 並批次翻譯標題...", expanded=True) as status:
+        q = build_query(final_keywords, final_journals, date_range_query)
+        st.write(f"搜尋語法: `{q[:50]}...`")
+        
+        # 抓取資料
+        raw_articles = fetch_headers(q, date_params, max_results, user_email)
+        
+        if raw_articles:
+            st.write(f"✅ 找到 {len(raw_articles)} 篇，正在進行 AI 標題批次翻譯...")
+            # 批次翻譯標題 (這一步很快)
+            translated_articles = batch_translate_titles(raw_articles, api_key, selected_model_name)
+            st.session_state.articles_data = translated_articles
+            status.update(label="搜尋完成！請在下方列表點選查看。", state="complete")
+        else:
+            status.update(label="❌ 找不到文章", state="error")
+    
+    st.session_state.search_trigger = False # 關閉觸發器
+
+# 2. 顯示列表 (快篩介面)
+if st.session_state.articles_data:
     st.divider()
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("📩 寄出彙整報告", type="primary"):
-            if not email_password: st.error("需輸入 Gmail App Password")
+    st.markdown(f"### 📚 搜尋結果列表 ({len(st.session_state.articles_data)} 篇)")
+    
+    for i, art in enumerate(st.session_state.articles_data):
+        # 使用容器框住每一篇
+        with st.container():
+            col1, col2 = st.columns([5, 1])
+            
+            with col1:
+                # 顯示標題與中文標題
+                st.markdown(f"**{i+1}. {art['title']}**")
+                st.markdown(f"<span style='color:#2e86c1; font-size:1.1em;'>{art['title_zh']}</span>", unsafe_allow_html=True)
+                st.caption(f"📖 {art['journal']} | 🗓️ [原文連結]({art['link']})")
+            
+            with col2:
+                # 分析按鈕 (Unique key very important)
+                btn_key = f"analyze_btn_{i}"
+                if st.button("🔍 詳細分析", key=btn_key):
+                    # 點擊時，馬上執行分析並存入 Cache
+                    with st.spinner("AI 正在深度閱讀此篇文章..."):
+                        if art['id'] not in st.session_state.analysis_cache:
+                            report = run_deep_analysis(art, api_key, selected_model_name)
+                            st.session_state.analysis_cache[art['id']] = report
+                            
+                            # 自動加入 Email 佇列
+                            email_item = {
+                                "title": art['title'],
+                                "html": f"<h3><a href='{art['link']}'>{art['title']} ({art['title_zh']})</a></h3><p>{art['journal']}</p>{report}"
+                            }
+                            # 避免重複加入
+                            if not any(d['title'] == art['title'] for d in st.session_state.email_queue):
+                                st.session_state.email_queue.append(email_item)
+
+            # 如果 Cache 裡有這篇的報告，就展開顯示
+            if art['id'] in st.session_state.analysis_cache:
+                with st.expander("🩺 查看 AI 深度分析報告", expanded=True):
+                    st.markdown(st.session_state.analysis_cache[art['id']], unsafe_allow_html=True)
+            
+            st.markdown("---")
+
+# 3. 購物車/寄信區
+if st.session_state.email_queue:
+    st.sidebar.divider()
+    st.sidebar.header(f"🛒 已選文獻 ({len(st.session_state.email_queue)})")
+    st.sidebar.info("您點擊過「詳細分析」的文章都會自動加入此清單。")
+    
+    if st.sidebar.button("📩 打包寄出所有已分析文獻", type="primary"):
+        if not email_password:
+            st.sidebar.error("請輸入 Gmail App Password")
+        else:
+            ok, msg = send_bulk_email(user_email, email_password, st.session_state.email_queue)
+            if ok:
+                st.sidebar.success("✅ 郵件已寄出！")
+                st.session_state.email_queue = [] # 清空
             else:
-                with st.spinner("寄信中..."):
-                    ok, m = send_mail(user_email, email_password, st.session_state.email_content)
-                    if ok: st.success(m)
-                    else: st.error(m)
+                st.sidebar.error(f"❌ 失敗: {msg}")
