@@ -10,7 +10,7 @@ import json
 import re
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="GynOnc 文獻系統 v6.1", page_icon="💎", layout="wide")
+st.set_page_config(page_title="GynOnc 文獻系統 v6.2 (修復版)", page_icon="💎", layout="wide")
 
 # --- Session State 初始化 ---
 if 'articles_data' not in st.session_state: st.session_state.articles_data = []
@@ -21,16 +21,15 @@ if 'search_trigger' not in st.session_state: st.session_state.search_trigger = F
 # --- 核心工具函數 ---
 
 def clean_json_text(text):
-    """清理 AI 回傳的 JSON 字串 (去除 markdown 標記)"""
+    """清理 AI 回傳的 JSON 字串"""
     text = text.strip()
-    # 移除 ```json ... ``` 包裹
     if text.startswith("```json"): text = text[7:]
     elif text.startswith("```"): text = text[3:]
     if text.endswith("```"): text = text[:-3]
     return text.strip()
 
 def get_available_models(api_key):
-    """嘗試取得可用模型列表，失敗則回傳空清單"""
+    """嘗試取得可用模型列表"""
     url = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){api_key}"
     try:
         response = requests.get(url)
@@ -46,18 +45,25 @@ def get_available_models(api_key):
 with st.sidebar:
     st.header("💎 設定與購物車")
     
-    # --- 1. 購物車/寄信區 (置頂) ---
+    # 1. Email 設定 (移到最外層，確保變數一定存在)
+    if 'EMAIL_ADDRESS' in st.secrets: 
+        user_email = st.secrets['EMAIL_ADDRESS']
+    else: 
+        user_email = st.text_input("您的 Email (必填)", "lionsmanic@gmail.com")
+        
+    if 'EMAIL_PASSWORD' in st.secrets: 
+        email_password = st.secrets['EMAIL_PASSWORD']
+    else: 
+        email_password = st.text_input("Gmail App Password (寄信用)", type="password")
+    
+    st.divider()
+
+    # 2. 購物車顯示區
     if st.session_state.email_queue:
         with st.expander(f"🛒 待寄出清單 ({len(st.session_state.email_queue)}篇)", expanded=True):
             for item in st.session_state.email_queue:
                 st.text(f"• {item['title'][:20]}...")
             
-            if 'EMAIL_ADDRESS' in st.secrets: user_email = st.secrets['EMAIL_ADDRESS']
-            else: user_email = st.text_input("您的 Email", "lionsmanic@gmail.com")
-            
-            if 'EMAIL_PASSWORD' in st.secrets: email_password = st.secrets['EMAIL_PASSWORD']
-            else: email_password = st.text_input("Gmail App Password", type="password")
-
             # 觸發寄信
             if st.button("📩 立即彙整寄出", type="primary"):
                 if not email_password:
@@ -66,21 +72,19 @@ with st.sidebar:
                     st.session_state.trigger_email = True
     else:
         st.info("目前購物車是空的。請在右側點擊「詳細分析」加入文章。")
-    
+
     st.divider()
 
-    # --- 2. API Key 與模型 (修正版：保證按鈕可按) ---
+    # 3. API Key 與模型
     if 'GEMINI_API_KEY' in st.secrets:
         api_key = st.secrets['GEMINI_API_KEY']
         st.success("🔑 API Key 已載入")
     else:
         api_key = st.text_input("Gemini API Key", type="password")
 
-    # 預設模型，防止變數為空
-    selected_model_name = "gemini-1.5-flash"
+    selected_model_name = "gemini-1.5-flash" # 預設值
 
     if api_key:
-        # 嘗試偵測模型，但不強制阻擋
         with st.spinner("連線 Google 中..."):
             available_models = get_available_models(api_key)
         
@@ -91,13 +95,11 @@ with st.sidebar:
             elif 'gemini-pro' in available_models: default_ix = available_models.index('gemini-pro')
             selected_model_name = st.selectbox("選擇模型:", available_models, index=default_ix)
         else:
-            st.warning("⚠️ 無法自動取得清單 (可能是 Key 權限或網路)，已使用預設值。")
-            # 這裡不鎖死，直接讓使用者用預設值，或者手動輸入
-            # selected_model_name 維持 "gemini-1.5-flash"
+            st.warning("⚠️ 無法自動取得清單，已使用預設值。")
 
     st.divider()
     
-    # --- 3. 搜尋條件 ---
+    # 4. 搜尋條件
     st.subheader("🔍 搜尋條件")
     KEYWORDS = {
         "🥚 婦癌 (Gyn Onc)": ["cervical cancer", "ovarian cancer", "endometrial cancer", "immunotherapy", "robotic surgery"],
@@ -120,7 +122,7 @@ with st.sidebar:
 
     st.divider()
 
-    # --- 4. 時間與數量 ---
+    # 5. 時間與數量
     date_mode = st.radio("📅 時間", ["最近幾天", "指定區間"], index=0)
     date_range_query = ""
     date_params = {}
@@ -139,15 +141,12 @@ with st.sidebar:
 
     max_results = st.number_input("篇數上限", 1, 100, 20)
     
-    # [修正] 移除 disabled 限制，確保按鈕永遠可按
     if st.button("🚀 極速搜尋", type="primary"):
         if not api_key:
             st.error("請先輸入 API Key")
         else:
-            # 重置搜尋狀態
             st.session_state.articles_data = []
             st.session_state.analysis_cache = {}
-            # 注意：不清除 email_queue，保留購物車
             st.session_state.search_trigger = True
 
 # --- 主要功能函數 ---
@@ -195,7 +194,6 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n): yield lst[i:i + n]
 
 def batch_translate_titles_robust(articles, key, model_name):
-    """分批翻譯標題"""
     if not articles: return []
     url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={key}"
     headers = {'Content-Type': 'application/json'}
@@ -227,14 +225,10 @@ def batch_translate_titles_robust(articles, key, model_name):
     return articles
 
 def run_deep_analysis_json(art, key, model_name):
-    """
-    【關鍵邏輯】：AI 輸出 JSON -> Python 轉成 HTML
-    這能 100% 避免亂碼問題
-    """
+    """AI 輸出 JSON -> Python 轉成 HTML (解決亂碼)"""
     url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={key}"
     headers = {'Content-Type': 'application/json'}
     
-    # Prompt 要求 JSON
     prompt_text = f"""
     You are an expert Gynecologic Oncologist. Analyze this abstract.
     Title: {art['title']}
@@ -256,29 +250,23 @@ def run_deep_analysis_json(art, key, model_name):
         response = requests.post(url, headers=headers, data=json.dumps(payload))
         if response.status_code == 200:
             txt = response.json()['candidates'][0]['content']['parts'][0]['text']
-            txt = clean_json_text(txt) # 清理 Markdown
-            
+            txt = clean_json_text(txt)
             try:
-                data = json.loads(txt) # 解析 JSON
-                
-                # --- 由 Python 產生完美的 HTML (使用 CSS 美化) ---
+                data = json.loads(txt)
                 html_output = f"""
                 <div style="font-family: sans-serif; line-height: 1.6; color: #333; background-color: #fff; padding: 10px; border-radius: 8px; border: 1px solid #eee;">
                     <div style="margin-bottom: 15px;">
                         <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 5px;">1. 🧪 研究方法 (Methods)</h4>
                         <div style="font-size: 0.95em;">{data.get('methods', '無資料')}</div>
                     </div>
-                    
                     <div style="margin-bottom: 15px;">
                         <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 5px;">2. 💡 發想緣起 (Rationale)</h4>
                         <div style="font-size: 0.95em;">{data.get('rationale', '無資料')}</div>
                     </div>
-                    
                     <div style="margin-bottom: 15px;">
                         <h4 style="color:#2e86c1; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 5px;">3. 📊 結果數據 (Results)</h4>
                         <div style="font-size: 0.95em;">{data.get('results', '無資料')}</div>
                     </div>
-                    
                     <div>
                         <h4 style="color:#d35400; margin:0 0 5px 0; border-bottom: 2px solid #f0f0f0; padding-bottom: 5px;">4. 🏥 臨床運用 (Implication)</h4>
                         <div style="font-size: 0.95em;">{data.get('implication', '無資料')}</div>
@@ -286,13 +274,9 @@ def run_deep_analysis_json(art, key, model_name):
                 </div>
                 """
                 return html_output
-                
-            except json.JSONDecodeError:
-                return f"<div style='color:red'>AI 回傳格式錯誤 (請重試)</div>"
-        else: 
-            return f"<div style='color:red'>API Error: {response.status_code}</div>"
-    except Exception as e: 
-        return f"<div style='color:red'>System Error: {str(e)}</div>"
+            except json.JSONDecodeError: return f"<div style='color:red'>JSON 解析失敗，請重試</div>"
+        else: return f"<div style='color:red'>API Error: {response.status_code}</div>"
+    except Exception as e: return f"<div style='color:red'>System Error: {str(e)}</div>"
 
 def send_bulk_email(to, pwd, queue):
     if not queue: return False, "清單為空"
@@ -323,8 +307,8 @@ def send_bulk_email(to, pwd, queue):
 
 # --- 主程式邏輯 ---
 
-st.title("💎 GynOnc 文獻系統 v6.1")
-st.caption("完整版：修正按鈕鎖定問題 + JSON 排版引擎")
+st.title("💎 GynOnc 文獻系統 v6.2")
+st.caption("修復版：解決變數 NameError，確保搜尋功能正常")
 
 # 1. 執行搜尋
 if st.session_state.search_trigger:
@@ -332,6 +316,7 @@ if st.session_state.search_trigger:
         q = build_query(final_keywords, final_journals, date_range_query)
         st.write(f"語法: `{q[:50]}...`")
         
+        # 這裡的 user_email 現在一定有定義了
         raw_articles = fetch_headers(q, date_params, max_results, user_email)
         
         if raw_articles:
@@ -354,7 +339,6 @@ if st.session_state.articles_data:
             col1, col2 = st.columns([5, 1])
             with col1:
                 st.markdown(f"**{i+1}. {art['title']}**")
-                # 顯示中文標題
                 st.markdown(f"<span style='color:#2e86c1; font-size:1.1em;'>{art.get('title_zh', '翻譯中...')}</span>", unsafe_allow_html=True)
                 st.caption(f"📖 {art['journal']} | [原文連結]({art['link']})")
             
@@ -363,11 +347,9 @@ if st.session_state.articles_data:
                 if st.button("🔍 詳細分析", key=btn_key):
                     with st.spinner("AI 正在深度閱讀並生成報告..."):
                         if art['id'] not in st.session_state.analysis_cache:
-                            # 呼叫 JSON 分析函數
                             report_html = run_deep_analysis_json(art, api_key, selected_model_name)
                             st.session_state.analysis_cache[art['id']] = report_html
                             
-                            # 加入購物車 (包含完整的 HTML 樣式)
                             email_item = {
                                 "title": art['title'],
                                 "html": f"""
@@ -379,24 +361,20 @@ if st.session_state.articles_data:
                                 </div>
                                 """
                             }
-                            # 避免重複
                             if not any(d['title'] == art['title'] for d in st.session_state.email_queue):
                                 st.session_state.email_queue.append(email_item)
-                                st.rerun() # 強制刷新側邊欄
+                                st.rerun()
 
-            # 顯示分析結果
             if art['id'] in st.session_state.analysis_cache:
                 with st.expander("🩺 深度分析報告", expanded=True):
-                    # 關鍵：這裡會正確渲染 Python 產生好的 HTML
                     st.markdown(st.session_state.analysis_cache[art['id']], unsafe_allow_html=True)
             st.markdown("---")
 
-# 處理側邊欄寄信觸發
 if getattr(st.session_state, 'trigger_email', False):
     ok, msg = send_bulk_email(user_email, email_password, st.session_state.email_queue)
     if ok:
         st.sidebar.success("✅ 郵件已成功寄出！")
-        st.session_state.email_queue = [] # 清空購物車
+        st.session_state.email_queue = []
         st.session_state.trigger_email = False
         time.sleep(2)
         st.rerun()
