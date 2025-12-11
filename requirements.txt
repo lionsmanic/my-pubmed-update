@@ -1,3 +1,4 @@
 streamlit
 biopython
 requests
+deep-translator
